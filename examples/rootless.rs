@@ -1,3 +1,4 @@
+use futures::FutureExt;
 use rucompart::{Compartment, compartmentalize};
 use tarpc::{client::Config, context::Context, service};
 use tokio::runtime::Runtime;
@@ -19,10 +20,11 @@ impl Rootless for RootlessService {
 }
 
 compartmentalize!(
+	:name "ROOTLESS",
 	ServeRootless,
 	RootlessService,
 	RootlessClient,
-	async fn setup(&self) -> Result<_, std::io::Error> {
+	async fn setup(&self, mode: rucompart::CompartmentMode) -> Result<_, std::io::Error> {
 		unsafe {
 			libc::setuid(65534);
 			Ok(())
@@ -31,14 +33,36 @@ compartmentalize!(
 );
 
 fn main() {
-	let (client, pid) = RootlessService
-		.spawn(
-			|| RootlessService.serve(),
-			|transport| {
-				tokio::spawn(async { RootlessClient::new(Config::default(), transport).spawn() })
-			},
-		)
-		.unwrap();
+	let client = if let Ok(standalone) = std::env::var("STANDALONE") {
+		RootlessService
+			.standalone(
+				|| RootlessService.serve(),
+				|transport| {
+					tokio::spawn(async {
+						RootlessClient::new(Config::default(), transport).spawn()
+					})
+				},
+				match standalone.as_str() {
+					"server" => true,
+					"client" => false,
+					other => panic!(r#"Only "server" and "client" standalone modes"#),
+				},
+			)
+			.unwrap()
+			.boxed()
+	} else {
+		RootlessService
+			.fork(
+				|| RootlessService.serve(),
+				|transport| {
+					tokio::spawn(async {
+						RootlessClient::new(Config::default(), transport).spawn()
+					})
+				},
+			)
+			.unwrap()
+			.boxed()
+	};
 	Runtime::new().unwrap().block_on(async move {
 		println!("The host's uid is {}, but...", unsafe { libc::getuid() });
 		let client: RootlessClient = client.await;

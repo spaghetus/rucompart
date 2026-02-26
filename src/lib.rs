@@ -1,29 +1,30 @@
-use std::{error::Error, marker::PhantomData, pin::Pin, task::Poll};
-
-use fork::fork;
-use futures::{Stream, StreamExt, task::SpawnError};
 use serde::{Deserialize, Serialize};
+use std::{convert::Infallible, error::Error};
 use tarpc::{
-	Transport,
 	serde_transport::{self, Transport as STransport},
-	server::{BaseChannel, Channel, Config, Serve},
-	tokio_serde::formats::{Bincode, SymmetricalBincode},
-	tokio_util::codec::{self, Framed, LengthDelimitedCodec},
+	server::{BaseChannel, Serve},
+	tokio_serde::formats::Bincode,
+	tokio_util::codec::LengthDelimitedCodec,
 };
 use tokio::{
-	io::{AsyncRead, AsyncWrite},
-	net::{
-		UnixDatagram, UnixStream,
-		unix::pipe::{Receiver, Sender, pipe},
-	},
+	net::UnixStream,
 	runtime::{Handle, Runtime},
 	task::JoinHandle,
 };
 
+pub enum CompartmentMode {
+	Fork,
+	StandaloneSock,
+}
+
 #[macro_export]
 macro_rules! compartmentalize {
-	($($serve:ident)::+, $service:ty, $client:ty, async fn setup(&self) -> Result<$_:ty, $setup_err:ty> $setup:tt) => {
+	($(:name $env_name:literal,)?$($serve:ident)::+, $service:ty, $client:ty, async fn setup(&self, $mname:ident: $(rucompart::)?CompartmentMode) -> Result<$_:ty, $setup_err:ty> $setup:tt) => {
 		impl rucompart::Compartment for $service {
+			$(
+				#[cfg(feature = "standalone")]
+				const ENV_PREFIX: &str = $env_name;
+			)?
 			type Error = $setup_err;
 
 			type Server = $($serve)::+<$service>;
@@ -32,25 +33,14 @@ macro_rules! compartmentalize {
 
 			fn setup(
 				&self,
+				$mname: rucompart::CompartmentMode
 			) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + Sync {
 				async { $setup }
 			}
 
 			fn serve(
 				server: Self::Server,
-				channel: tarpc::server::BaseChannel<
-					<Self::Server as tarpc::server::Serve>::Req,
-					<Self::Server as tarpc::server::Serve>::Resp,
-					tarpc::serde_transport::Transport<
-						tokio::net::UnixStream,
-						tarpc::ClientMessage<<Self::Server as tarpc::server::Serve>::Req>,
-						tarpc::Response<<Self::Server as tarpc::server::Serve>::Resp>,
-						tarpc::tokio_serde::formats::Bincode<
-							tarpc::ClientMessage<<Self::Server as tarpc::server::Serve>::Req>,
-							tarpc::Response<<Self::Server as tarpc::server::Serve>::Resp>,
-						>,
-					>,
-				>,
+				channel: rucompart::CompartmentChannel<Self>,
 			) -> impl Future<Output = ()> + Send + Sync {
 				use futures::StreamExt;
 				async move {
@@ -65,56 +55,53 @@ macro_rules! compartmentalize {
 	};
 }
 
-pub enum Side {
-	Host,
-	Compartment,
-}
+pub type CompartmentChannel<C> = BaseChannel<
+	<<C as Compartment>::Server as Serve>::Req,
+	<<C as Compartment>::Server as Serve>::Resp,
+	STransport<
+		UnixStream,
+		tarpc::ClientMessage<<<C as Compartment>::Server as Serve>::Req>,
+		tarpc::Response<<<C as Compartment>::Server as Serve>::Resp>,
+		Bincode<
+			tarpc::ClientMessage<<<C as Compartment>::Server as Serve>::Req>,
+			tarpc::Response<<<C as Compartment>::Server as Serve>::Resp>,
+		>,
+	>,
+>;
 
-#[derive(Debug, thiserror::Error)]
-pub enum TransportError {
-	#[error("Problem communicating")]
-	IoError(#[from] tokio::io::Error),
-}
+pub type CompartmentTransport<C> = STransport<
+	UnixStream,
+	tarpc::Response<<<C as Compartment>::Server as Serve>::Resp>,
+	tarpc::ClientMessage<<<C as Compartment>::Server as Serve>::Req>,
+	Bincode<
+		tarpc::Response<<<C as Compartment>::Server as Serve>::Resp>,
+		tarpc::ClientMessage<<<C as Compartment>::Server as Serve>::Req>,
+	>,
+>;
 
 pub trait Compartment: Sized + Send + Sync {
+	#[cfg(feature = "standalone")]
+	const ENV_PREFIX: &str;
+
 	type Error: Error + From<std::io::Error>;
-	fn setup(&self) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + Sync;
+	fn setup(
+		&self,
+		mode: CompartmentMode,
+	) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + Sync;
 
 	fn serve(
 		server: Self::Server,
-		channel: BaseChannel<
-			<<Self as Compartment>::Server as Serve>::Req,
-			<<Self as Compartment>::Server as Serve>::Resp,
-			STransport<
-				UnixStream,
-				tarpc::ClientMessage<<<Self as Compartment>::Server as Serve>::Req>,
-				tarpc::Response<<<Self as Compartment>::Server as Serve>::Resp>,
-				Bincode<
-					tarpc::ClientMessage<<<Self as Compartment>::Server as Serve>::Req>,
-					tarpc::Response<<<Self as Compartment>::Server as Serve>::Resp>,
-				>,
-			>,
-		>,
+		channel: CompartmentChannel<Self>,
 	) -> impl Future<Output = ()> + Send + Sync;
 
 	type Server: Serve + Clone + Send + Sync;
 	type Client: Send + Sync + 'static;
 
-	fn spawn(
+	fn fork(
 		self,
 		server: impl FnOnce() -> Self::Server + Send + Sync,
-		client: impl FnOnce(
-			STransport<
-				UnixStream,
-				tarpc::Response<<Self::Server as Serve>::Resp>,
-				tarpc::ClientMessage<<Self::Server as Serve>::Req>,
-				Bincode<
-					tarpc::Response<<Self::Server as Serve>::Resp>,
-					tarpc::ClientMessage<<Self::Server as Serve>::Req>,
-				>,
-			>,
-		) -> JoinHandle<Self::Client>,
-	) -> Result<(impl Future<Output = Self::Client>, i32), Self::Error>
+		client: impl FnOnce(CompartmentTransport<Self>) -> JoinHandle<Self::Client>,
+	) -> Result<impl Future<Output = Self::Client>, Self::Error>
 	where
 		<Self::Server as Serve>::Req: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
 		<Self::Server as Serve>::Resp:
@@ -136,21 +123,74 @@ pub trait Compartment: Sized + Send + Sync {
 				let framed = codec_builder.new_framed(guest);
 				let transport = tarpc::serde_transport::new(framed, Bincode::default());
 				let channel = BaseChannel::with_defaults(transport);
-				self.setup().await.unwrap();
+				self.setup(CompartmentMode::Fork).await.unwrap();
 				Self::serve(server(), channel).await;
 				std::process::exit(0)
 			}),
-			pid => Ok((
-				async move {
-					std::mem::forget(guest);
-					let host = UnixStream::from_std(host).unwrap();
-					let codec_builder = LengthDelimitedCodec::builder();
-					let framed = codec_builder.new_framed(host);
-					let transport = serde_transport::new(framed, Bincode::default());
-					client(transport).await.unwrap()
-				},
-				pid,
-			)),
+			_ => Ok(async move {
+				std::mem::forget(guest);
+				let host = UnixStream::from_std(host).unwrap();
+				let codec_builder = LengthDelimitedCodec::builder();
+				let framed = codec_builder.new_framed(host);
+				let transport = serde_transport::new(framed, Bincode::default());
+				client(transport).await.unwrap()
+			}),
+		}
+	}
+
+	/// Check whether we're called as a standalone instance of this compartment; if so, this function never returns.
+	#[cfg(feature = "standalone")]
+	fn standalone(
+		&self,
+		server: impl FnOnce() -> Self::Server + Send + Sync,
+		client: impl FnOnce(CompartmentTransport<Self>) -> JoinHandle<Self::Client>,
+		serve: bool,
+	) -> Result<impl Future<Output = Self::Client>, Infallible>
+	where
+		<Self::Server as Serve>::Req: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
+		<Self::Server as Serve>::Resp:
+			Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
+	{
+		use std::{path::PathBuf, str::FromStr};
+		let env_name = format!(
+			"{}_{}_ADDR",
+			env!("CARGO_PKG_NAME").to_ascii_uppercase(),
+			Self::ENV_PREFIX
+		);
+		let path = std::env::var(env_name).expect("Socket address variable is missing");
+		// If the environment variable *isn't set*, we return None
+		// (a zero-sized type, because the Some arm of the enum contains a bottom type and can never exist)
+		if serve {
+			// systemd_socket::init().expect("Failed to initialize systemd sockets");
+			// let socket_addr = systemd_socket::SocketAddr::from_str(path).unwrap();
+			Runtime::new().unwrap().block_on(async move {
+				use futures::StreamExt;
+				use tarpc::serde_transport::unix::listen_on;
+				use tokio::net::UnixListener;
+				let listener = UnixListener::bind(path).unwrap();
+				let server = server();
+				listen_on(listener, Bincode::default)
+					.await
+					.unwrap()
+					.filter_map(|r| async { r.ok() })
+					.for_each(move |transport| {
+						let server = server.clone();
+						async move {
+							let channel = BaseChannel::with_defaults(transport);
+							Self::serve(server.clone(), channel).await;
+						}
+					})
+					.await;
+			});
+			unreachable!()
+		} else {
+			Ok(async move {
+				let stream = UnixStream::connect(path).await.unwrap();
+				let codec_builder = LengthDelimitedCodec::builder();
+				let framed = codec_builder.new_framed(stream);
+				let transport = serde_transport::new(framed, Bincode::default());
+				client(transport).await.unwrap()
+			})
 		}
 	}
 }
