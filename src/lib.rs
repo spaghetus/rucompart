@@ -1,5 +1,6 @@
+use clap::Subcommand;
 use serde::{Deserialize, Serialize};
-use std::{convert::Infallible, error::Error};
+use std::{convert::Infallible, error::Error, net::SocketAddr, path::Path};
 use tarpc::{
 	serde_transport::{self, Transport as STransport},
 	server::{BaseChannel, Serve},
@@ -7,7 +8,8 @@ use tarpc::{
 	tokio_util::codec::LengthDelimitedCodec,
 };
 use tokio::{
-	net::UnixStream,
+	io::{AsyncRead, AsyncWrite},
+	net::{TcpListener, TcpStream, UnixStream},
 	runtime::{Handle, Runtime},
 	task::JoinHandle,
 };
@@ -19,7 +21,7 @@ pub enum CompartmentMode {
 
 #[macro_export]
 macro_rules! compartmentalize {
-	($(:name $env_name:literal,)?$($serve:ident)::+, $service:ty, $client:ty, async fn setup(&self, $mname:ident: $(rucompart::)?CompartmentMode) -> Result<$_:ty, $setup_err:ty> $setup:tt) => {
+	($(:name $env_name:literal,)?$($serve:ident)::+, $service:ty, $client:ty, async fn setup(&mut self, $mname:ident: $(rucompart::)?CompartmentMode) -> Result<$_:ty, $setup_err:ty> $setup:tt) => {
 		impl rucompart::Compartment for $service {
 			$(
 				#[cfg(feature = "standalone")]
@@ -32,15 +34,15 @@ macro_rules! compartmentalize {
 			type Client = $client;
 
 			fn setup(
-				&self,
+				&mut self,
 				$mname: rucompart::CompartmentMode
 			) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + Sync {
 				async { $setup }
 			}
 
-			fn serve(
+			fn serve<STR: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync>(
 				server: Self::Server,
-				channel: rucompart::CompartmentChannel<Self>,
+				channel: rucompart::CompartmentChannel<Self, STR>,
 			) -> impl Future<Output = ()> + Send + Sync {
 				use futures::StreamExt;
 				async move {
@@ -55,11 +57,58 @@ macro_rules! compartmentalize {
 	};
 }
 
-pub type CompartmentChannel<C> = BaseChannel<
+#[macro_export]
+macro_rules! compartment_connect {
+	($addr:expr, $service:expr, $client:ty) => {
+		$addr
+			.map(|addr| {
+				if let Ok(addr) = std::net::SocketAddr::from_str(&addr) {
+					$service
+						.connect_to_tcp(
+							|transport| {
+								tokio::spawn(async {
+									<$client>::new(tarpc::client::Config::default(), transport)
+										.spawn()
+								})
+							},
+							addr,
+						)
+						.boxed()
+				} else {
+					$service
+						.connect_to_unix(
+							|transport| {
+								tokio::spawn(async {
+									<$client>::new(tarpc::client::Config::default(), transport)
+										.spawn()
+								})
+							},
+							addr,
+						)
+						.boxed()
+				}
+			})
+			.unwrap_or_else(|| {
+				$service
+					.fork(
+						|| $service.serve(),
+						|transport| {
+							tokio::spawn(async {
+								<$client>::new(tarpc::client::Config::default(), transport).spawn()
+							})
+						},
+					)
+					.unwrap()
+					.boxed()
+			})
+	};
+}
+
+pub type CompartmentChannel<C, STR> = BaseChannel<
 	<<C as Compartment>::Server as Serve>::Req,
 	<<C as Compartment>::Server as Serve>::Resp,
 	STransport<
-		UnixStream,
+		STR,
 		tarpc::ClientMessage<<<C as Compartment>::Server as Serve>::Req>,
 		tarpc::Response<<<C as Compartment>::Server as Serve>::Resp>,
 		Bincode<
@@ -69,8 +118,8 @@ pub type CompartmentChannel<C> = BaseChannel<
 	>,
 >;
 
-pub type CompartmentTransport<C> = STransport<
-	UnixStream,
+pub type CompartmentTransport<C, STR> = STransport<
+	STR,
 	tarpc::Response<<<C as Compartment>::Server as Serve>::Resp>,
 	tarpc::ClientMessage<<<C as Compartment>::Server as Serve>::Req>,
 	Bincode<
@@ -85,22 +134,23 @@ pub trait Compartment: Sized + Send + Sync {
 
 	type Error: Error + From<std::io::Error>;
 	fn setup(
-		&self,
+		&mut self,
 		mode: CompartmentMode,
 	) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + Sync;
 
-	fn serve(
+	fn serve<STR: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync>(
 		server: Self::Server,
-		channel: CompartmentChannel<Self>,
+		channel: CompartmentChannel<Self, STR>,
 	) -> impl Future<Output = ()> + Send + Sync;
 
 	type Server: Serve + Clone + Send + Sync;
 	type Client: Send + Sync + 'static;
 
+	#[deprecated]
 	fn fork(
-		self,
+		mut self,
 		server: impl FnOnce() -> Self::Server + Send + Sync,
-		client: impl FnOnce(CompartmentTransport<Self>) -> JoinHandle<Self::Client>,
+		client: impl FnOnce(CompartmentTransport<Self, UnixStream>) -> JoinHandle<Self::Client>,
 	) -> Result<impl Future<Output = Self::Client>, Self::Error>
 	where
 		<Self::Server as Serve>::Req: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
@@ -139,11 +189,12 @@ pub trait Compartment: Sized + Send + Sync {
 	}
 
 	/// Check whether we're called as a standalone instance of this compartment; if so, this function never returns.
+	#[deprecated]
 	#[cfg(feature = "standalone")]
 	fn standalone(
 		&self,
 		server: impl FnOnce() -> Self::Server + Send + Sync,
-		client: impl FnOnce(CompartmentTransport<Self>) -> JoinHandle<Self::Client>,
+		client: impl FnOnce(CompartmentTransport<Self, UnixStream>) -> JoinHandle<Self::Client>,
 		serve: bool,
 	) -> Result<impl Future<Output = Self::Client>, Infallible>
 	where
@@ -192,5 +243,109 @@ pub trait Compartment: Sized + Send + Sync {
 				client(transport).await.unwrap()
 			})
 		}
+	}
+
+	fn connect_to_stream<STR: AsyncRead + AsyncWrite + Send + Sync>(
+		&self,
+		client: impl FnOnce(CompartmentTransport<Self, STR>) -> JoinHandle<Self::Client>,
+		stream: STR,
+	) -> impl Future<Output = Self::Client>
+	where
+		<Self::Server as Serve>::Req: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
+		<Self::Server as Serve>::Resp:
+			Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
+	{
+		async move {
+			let codec_builder = LengthDelimitedCodec::builder();
+			let framed = codec_builder.new_framed(stream);
+			let transport = serde_transport::new(framed, Bincode::default());
+			client(transport).await.unwrap()
+		}
+	}
+
+	fn connect_to_unix(
+		&self,
+		client: impl FnOnce(CompartmentTransport<Self, UnixStream>) -> JoinHandle<Self::Client>,
+		addr: impl AsRef<Path>,
+	) -> impl Future<Output = Self::Client>
+	where
+		<Self::Server as Serve>::Req: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
+		<Self::Server as Serve>::Resp:
+			Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
+	{
+		async move {
+			let stream = UnixStream::connect(addr).await.unwrap();
+			self.connect_to_stream(client, stream).await
+		}
+	}
+
+	fn connect_to_tcp(
+		&self,
+		client: impl FnOnce(CompartmentTransport<Self, TcpStream>) -> JoinHandle<Self::Client>,
+		addr: SocketAddr,
+	) -> impl Future<Output = Self::Client>
+	where
+		<Self::Server as Serve>::Req: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
+		<Self::Server as Serve>::Resp:
+			Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
+	{
+		async move {
+			let stream = TcpStream::connect(addr).await.unwrap();
+			self.connect_to_stream(client, stream).await
+		}
+	}
+
+	/// Run a standalone compartment, listening on a certain stream.
+	fn listen_on_stream(
+		&self,
+		server: Self::Server,
+		stream: impl AsyncRead + AsyncWrite + Send + Sync,
+	) -> impl std::future::Future<Output = Infallible> + Send
+	where
+		<Self::Server as Serve>::Req: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
+		<Self::Server as Serve>::Resp:
+			Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
+	{
+		async {
+			let codec_builder = LengthDelimitedCodec::builder();
+			let framed = codec_builder.new_framed(stream);
+			let transport = tarpc::serde_transport::new(framed, Bincode::default());
+			let channel = BaseChannel::with_defaults(transport);
+			Self::serve(server, channel).await;
+			std::process::exit(0)
+		}
+	}
+
+	/// Run a standalone compartment, listening on a certain unix socket.
+	fn listen_on_unix(&self, server: Self::Server, path: impl AsRef<Path>) -> !
+	where
+		<Self::Server as Serve>::Req: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
+		<Self::Server as Serve>::Resp:
+			Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
+	{
+		Runtime::new().unwrap().block_on(async move {
+			use tokio::net::UnixListener;
+			let listener = UnixListener::bind(path).unwrap();
+			let (stream, _) = listener.accept().await.unwrap();
+			self.listen_on_stream(server, stream).await;
+		});
+		unreachable!()
+	}
+
+	/// Run a standalone compartment, listening on a certain TCP socket.
+	fn listen_on_tcp(&self, server: Self::Server, addr: SocketAddr) -> !
+	where
+		<Self::Server as Serve>::Req: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
+		<Self::Server as Serve>::Resp:
+			Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
+	{
+		Runtime::new().unwrap().block_on(async move {
+			use futures::StreamExt;
+			use tarpc::serde_transport::tcp::listen_on;
+			let listener = TcpListener::bind(addr).await.unwrap();
+			let (stream, _) = listener.accept().await.unwrap();
+			self.listen_on_stream(server, stream).await;
+		});
+		unreachable!()
 	}
 }

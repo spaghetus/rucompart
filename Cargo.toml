@@ -4,11 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+clap = { version = "4.6.0", features = ["derive"] }
 fork = "0.6.0"
 futures = "0.3.31"
 libc = "0.2.181"
 serde = { version = "1.0.228", features = ["derive"] }
-tarpc = { version = "0.37.0", features = ["serde-transport", "serde-transport-bincode", "unix"] }
+tarpc = { version = "0.37.0", features = [
+    "serde-transport",
+    "serde-transport-bincode",
+    "unix",
+    "tcp",
+] }
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread"] }
 
