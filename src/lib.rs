@@ -40,7 +40,7 @@ macro_rules! compartmentalize {
 			fn serve<STR: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync>(
 				server: Self::Server,
 				channel: rucompart::CompartmentChannel<Self, STR>,
-			) -> impl Future<Output = ()> + Send + Sync {
+			) -> impl std::future::Future<Output = ()> + Send + Sync {
 				use futures::StreamExt;
 				async move {
 					tarpc::server::Channel::execute(channel, server.clone())

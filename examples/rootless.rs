@@ -1,9 +1,12 @@
 use clap::{Parser, Subcommand};
 use futures::FutureExt;
 use rucompart::{Compartment, compartment_connect, compartmentalize};
-use std::str::FromStr;
+use std::{os::fd::FromRawFd, str::FromStr};
 use tarpc::{context::Context, service};
-use tokio::runtime::Runtime;
+use tokio::{
+	net::{UnixSocket, UnixStream},
+	runtime::Runtime,
+};
 
 #[service]
 pub trait Rootless {
@@ -22,7 +25,7 @@ impl Rootless for RootlessService {
 }
 
 compartmentalize!(
-	:name "ROOTLESS",
+	"ROOTLESS",
 	ServeRootless,
 	RootlessService,
 	RootlessClient,
@@ -54,7 +57,16 @@ struct Args {
 fn main() {
 	let Args { cmd } = Args::parse();
 	if let Cmd::Rootless { socket_address } = cmd {
-		if let Ok(addr) = std::net::SocketAddr::from_str(&socket_address) {
+		if socket_address == "systemd" {
+			let fd = std::env::var("LISTEN_FDS").unwrap().parse().unwrap();
+			let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+			stream.set_nonblocking(true).unwrap();
+			let stream = UnixStream::from_std(stream).unwrap();
+			Runtime::new()
+				.unwrap()
+				.block_on(RootlessService.listen_on_stream(RootlessService.serve(), stream));
+			unreachable!()
+		} else if let Ok(addr) = std::net::SocketAddr::from_str(&socket_address) {
 			RootlessService.listen_on_tcp(RootlessService.serve(), addr)
 		} else {
 			RootlessService.listen_on_unix(RootlessService.serve(), socket_address)
