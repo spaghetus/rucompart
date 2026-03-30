@@ -1,6 +1,6 @@
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
-use std::{convert::Infallible, error::Error, net::SocketAddr, path::Path};
+use std::{error::Error, net::SocketAddr, path::Path};
 use tarpc::{
 	serde_transport::{self, Transport as STransport},
 	server::{BaseChannel, Serve},
@@ -21,12 +21,9 @@ pub enum CompartmentMode {
 
 #[macro_export]
 macro_rules! compartmentalize {
-	($(:name $env_name:literal,)?$($serve:ident)::+, $service:ty, $client:ty, async fn setup(&mut self, $mname:ident: $(rucompart::)?CompartmentMode) -> Result<$_:ty, $setup_err:ty> $setup:tt) => {
+	($env_name:literal, $($serve:ident)::+, $service:ty, $client:ty, async fn setup(&mut self, $mname:ident: $(rucompart::)?CompartmentMode) -> Result<$_:ty, $setup_err:ty> $setup:tt) => {
 		impl rucompart::Compartment for $service {
-			$(
-				#[cfg(feature = "standalone")]
-				const ENV_PREFIX: &str = $env_name;
-			)?
+			const ENV_PREFIX: &str = $env_name;
 			type Error = $setup_err;
 
 			type Server = $($serve)::+<$service>;
@@ -59,49 +56,50 @@ macro_rules! compartmentalize {
 
 #[macro_export]
 macro_rules! compartment_connect {
-	($addr:expr, $service:expr, $client:ty) => {
-		$addr
-			.map(|addr| {
-				if let Ok(addr) = std::net::SocketAddr::from_str(&addr) {
-					$service
-						.connect_to_tcp(
-							|transport| {
-								tokio::spawn(async {
-									<$client>::new(tarpc::client::Config::default(), transport)
-										.spawn()
-								})
-							},
-							addr,
-						)
-						.boxed()
-				} else {
-					$service
-						.connect_to_unix(
-							|transport| {
-								tokio::spawn(async {
-									<$client>::new(tarpc::client::Config::default(), transport)
-										.spawn()
-								})
-							},
-							addr,
-						)
-						.boxed()
-				}
-			})
-			.unwrap_or_else(|| {
+	($addr:expr, $service:expr, $client:ty) => {{
+		use futures::FutureExt;
+		use rucompart::Compartment;
+		let addr: Option<String> = $addr;
+		addr.map(|addr| {
+			use std::str::FromStr;
+			if let Ok(addr) = std::net::SocketAddr::from_str(&addr) {
 				$service
-					.fork(
-						|| $service.serve(),
+					.connect_to_tcp(
 						|transport| {
 							tokio::spawn(async {
 								<$client>::new(tarpc::client::Config::default(), transport).spawn()
 							})
 						},
+						addr,
 					)
-					.unwrap()
 					.boxed()
-			})
-	};
+			} else {
+				$service
+					.connect_to_unix(
+						|transport| {
+							tokio::spawn(async {
+								<$client>::new(tarpc::client::Config::default(), transport).spawn()
+							})
+						},
+						addr,
+					)
+					.boxed()
+			}
+		})
+		.unwrap_or_else(|| {
+			$service
+				.fork(
+					|| $service.serve(),
+					|transport| {
+						tokio::spawn(async {
+							<$client>::new(tarpc::client::Config::default(), transport).spawn()
+						})
+					},
+				)
+				.unwrap()
+				.boxed()
+		})
+	}};
 }
 
 pub type CompartmentChannel<C, STR> = BaseChannel<
@@ -129,7 +127,6 @@ pub type CompartmentTransport<C, STR> = STransport<
 >;
 
 pub trait Compartment: Sized + Send + Sync {
-	#[cfg(feature = "standalone")]
 	const ENV_PREFIX: &str;
 
 	type Error: Error + From<std::io::Error>;
@@ -146,7 +143,6 @@ pub trait Compartment: Sized + Send + Sync {
 	type Server: Serve + Clone + Send + Sync;
 	type Client: Send + Sync + 'static;
 
-	#[deprecated]
 	fn fork(
 		mut self,
 		server: impl FnOnce() -> Self::Server + Send + Sync,
@@ -196,13 +192,12 @@ pub trait Compartment: Sized + Send + Sync {
 		server: impl FnOnce() -> Self::Server + Send + Sync,
 		client: impl FnOnce(CompartmentTransport<Self, UnixStream>) -> JoinHandle<Self::Client>,
 		serve: bool,
-	) -> Result<impl Future<Output = Self::Client>, Infallible>
+	) -> Result<impl Future<Output = Self::Client>, std::convert::Infallible>
 	where
 		<Self::Server as Serve>::Req: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
 		<Self::Server as Serve>::Resp:
 			Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
 	{
-		use std::{path::PathBuf, str::FromStr};
 		let env_name = format!(
 			"{}_{}_ADDR",
 			env!("CARGO_PKG_NAME").to_ascii_uppercase(),
@@ -300,7 +295,7 @@ pub trait Compartment: Sized + Send + Sync {
 		&self,
 		server: Self::Server,
 		stream: impl AsyncRead + AsyncWrite + Send + Sync,
-	) -> impl std::future::Future<Output = Infallible> + Send
+	) -> impl std::future::Future<Output = ()> + Send
 	where
 		<Self::Server as Serve>::Req: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
 		<Self::Server as Serve>::Resp:
