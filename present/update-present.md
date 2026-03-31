@@ -3,12 +3,14 @@ RUCOMPART
 
 *(This demo is best viewed using "Presenterm" in an advanced terminal like `kitty`)*
 
+*(Also, see the `present` directory to see the source code of the demos shown here)*
+
 <!-- pause -->
 <!-- font_size: 2 -->
 In short:
 <!-- font_size: 1 -->
 
-```file +auto_exec:rust-script
+```file +exec:rust-script
 path: front-demo.rs
 language: rust
 ```
@@ -19,8 +21,9 @@ Bill of Materials
 ====
 <!-- font_size: 2 -->
 * Rust, a modern systems programming language
-* tokio, an event-loop-based asynchronous runtime
-* tarpc, an RPC framework using macros to define commands without leaving Rust
+* `tokio`, an event-loop-based asynchronous runtime
+* `tarpc`, an RPC framework using macros to define commands without leaving Rust
+* `serde`, a macro-based framework for **ser**ializing and **de**serializing data structures.
 
 <!-- end_slide -->
 

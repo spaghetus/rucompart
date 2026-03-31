@@ -37,6 +37,8 @@ compartmentalize!(
 	}
 );
 
+// I'd like to automate the argument-parsing part, though with how clap's
+// syntax works it might be a little troublesome.
 #[derive(Subcommand)]
 enum Cmd {
 	Rootless {

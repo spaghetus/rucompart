@@ -1,4 +1,3 @@
-use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use std::{error::Error, net::SocketAddr, path::Path};
 use tarpc::{
@@ -335,8 +334,6 @@ pub trait Compartment: Sized + Send + Sync {
 			Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
 	{
 		Runtime::new().unwrap().block_on(async move {
-			use futures::StreamExt;
-			use tarpc::serde_transport::tcp::listen_on;
 			let listener = TcpListener::bind(addr).await.unwrap();
 			let (stream, _) = listener.accept().await.unwrap();
 			self.listen_on_stream(server, stream).await;
