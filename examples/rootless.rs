@@ -1,12 +1,7 @@
-use clap::{Parser, Subcommand};
 use futures::FutureExt;
-use rucompart::{Compartment, compartment_connect, compartmentalize};
-use std::{os::fd::FromRawFd, str::FromStr};
-use tarpc::{context::Context, service};
-use tokio::{
-	net::{UnixSocket, UnixStream},
-	runtime::Runtime,
-};
+use rucompart::{Compartment, compartmentalize};
+use tarpc::{client::Config, context::Context, service};
+use tokio::runtime::Runtime;
 
 #[service]
 pub trait Rootless {
@@ -29,7 +24,10 @@ compartmentalize!(
 	ServeRootless,
 	RootlessService,
 	RootlessClient,
-	async fn setup(&mut self, mode: rucompart::CompartmentMode) -> Result<_, std::io::Error> {
+	async fn setup(
+		service: &mut Self::Server,
+		mode: rucompart::CompartmentMode,
+	) -> Result<_, std::io::Error> {
 		unsafe {
 			libc::setuid(65534);
 			Ok(())
@@ -37,51 +35,38 @@ compartmentalize!(
 	}
 );
 
-// I'd like to automate the argument-parsing part, though with how clap's
-// syntax works it might be a little troublesome.
-#[derive(Subcommand)]
-enum Cmd {
-	Rootless {
-		socket_address: String,
-	},
-	Main {
-		#[arg(long)]
-		rootless_addr: Option<String>,
-	},
-}
-
-#[derive(Parser)]
-struct Args {
-	#[command(subcommand)]
-	cmd: Cmd,
-}
-
 fn main() {
-	let Args { cmd } = Args::parse();
-	if let Cmd::Rootless { socket_address } = cmd {
-		if socket_address == "systemd" {
-			let fd = std::env::var("LISTEN_FDS").unwrap().parse().unwrap();
-			let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
-			stream.set_nonblocking(true).unwrap();
-			let stream = UnixStream::from_std(stream).unwrap();
-			Runtime::new()
-				.unwrap()
-				.block_on(RootlessService.listen_on_stream(RootlessService.serve(), stream));
-			unreachable!()
-		} else if let Ok(addr) = std::net::SocketAddr::from_str(&socket_address) {
-			RootlessService.listen_on_tcp(RootlessService.serve(), addr)
-		} else {
-			RootlessService.listen_on_unix(RootlessService.serve(), socket_address)
-		}
+	let client = if let Ok(standalone) = std::env::var("STANDALONE") {
+		RootlessService
+			.standalone(
+				|| RootlessService.serve(),
+				|transport| {
+					tokio::spawn(async {
+						RootlessClient::new(Config::default(), transport).spawn()
+					})
+				},
+				match standalone.as_str() {
+					"server" => true,
+					"client" => false,
+					other => panic!(r#"Only "server" and "client" standalone modes"#),
+				},
+			)
+			.unwrap()
+			.boxed()
+	} else {
+		RootlessService::fork(
+			|| RootlessService.serve(),
+			|transport| {
+				tokio::spawn(async { RootlessClient::new(Config::default(), transport).spawn() })
+			},
+		)
+		.unwrap()
+		.boxed()
 	};
-	let Cmd::Main { rootless_addr } = cmd else {
-		unreachable!()
-	};
-	let rootless_client = compartment_connect!(rootless_addr, RootlessService, RootlessClient);
 	Runtime::new().unwrap().block_on(async move {
 		println!("The host's uid is {}, but...", unsafe { libc::getuid() });
-		let rootless_client: RootlessClient = rootless_client.await;
-		rootless_client
+		let client: RootlessClient = client.await;
+		client
 			.hello(Context::current(), "world".into())
 			.await
 			.unwrap();

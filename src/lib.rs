@@ -1,9 +1,11 @@
+pub mod chan;
+
 use serde::{Deserialize, Serialize};
 use std::{error::Error, net::SocketAddr, path::Path};
 use tarpc::{
 	serde_transport::{self, Transport as STransport},
 	server::{BaseChannel, Serve},
-	tokio_serde::formats::Bincode,
+	tokio_serde::formats::Json,
 	tokio_util::codec::LengthDelimitedCodec,
 };
 use tokio::{
@@ -20,7 +22,7 @@ pub enum CompartmentMode {
 
 #[macro_export]
 macro_rules! compartmentalize {
-	($env_name:literal, $($serve:ident)::+, $service:ty, $client:ty, async fn setup(&mut self, $mname:ident: $(rucompart::)?CompartmentMode) -> Result<$_:ty, $setup_err:ty> $setup:tt) => {
+	($env_name:literal, $($serve:ident)::+, $service:ty, $client:ty, async fn setup($sname:ident: &mut Self::Server, $mname:ident: $(rucompart::)?CompartmentMode$(,)?) -> Result<$_:ty, $setup_err:ty> $setup:tt) => {
 		impl rucompart::Compartment for $service {
 			const ENV_PREFIX: &str = $env_name;
 			type Error = $setup_err;
@@ -30,7 +32,7 @@ macro_rules! compartmentalize {
 			type Client = $client;
 
 			fn setup(
-				&mut self,
+				$sname: &mut Self::Server,
 				$mname: rucompart::CompartmentMode
 			) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + Sync {
 				async { $setup }
@@ -55,48 +57,45 @@ macro_rules! compartmentalize {
 
 #[macro_export]
 macro_rules! compartment_connect {
-	($addr:expr, $service:expr, $client:ty) => {{
+	($addr:expr, $service:ty, $server:expr, $client:ty) => {{
 		use futures::FutureExt;
 		use rucompart::Compartment;
 		let addr: Option<String> = $addr;
 		addr.map(|addr| {
 			use std::str::FromStr;
 			if let Ok(addr) = std::net::SocketAddr::from_str(&addr) {
-				$service
-					.connect_to_tcp(
-						|transport| {
-							tokio::spawn(async {
-								<$client>::new(tarpc::client::Config::default(), transport).spawn()
-							})
-						},
-						addr,
-					)
-					.boxed()
-			} else {
-				$service
-					.connect_to_unix(
-						|transport| {
-							tokio::spawn(async {
-								<$client>::new(tarpc::client::Config::default(), transport).spawn()
-							})
-						},
-						addr,
-					)
-					.boxed()
-			}
-		})
-		.unwrap_or_else(|| {
-			$service
-				.fork(
-					|| $service.serve(),
+				<$service>::connect_to_tcp(
 					|transport| {
 						tokio::spawn(async {
 							<$client>::new(tarpc::client::Config::default(), transport).spawn()
 						})
 					},
+					addr,
 				)
-				.unwrap()
 				.boxed()
+			} else {
+				<$service>::connect_to_unix(
+					|transport| {
+						tokio::spawn(async {
+							<$client>::new(tarpc::client::Config::default(), transport).spawn()
+						})
+					},
+					addr,
+				)
+				.boxed()
+			}
+		})
+		.unwrap_or_else(|| {
+			<$service>::fork(
+				|| ($server)(),
+				|transport| {
+					tokio::spawn(async {
+						<$client>::new(tarpc::client::Config::default(), transport).spawn()
+					})
+				},
+			)
+			.unwrap()
+			.boxed()
 		})
 	}};
 }
@@ -108,7 +107,7 @@ pub type CompartmentChannel<C, STR> = BaseChannel<
 		STR,
 		tarpc::ClientMessage<<<C as Compartment>::Server as Serve>::Req>,
 		tarpc::Response<<<C as Compartment>::Server as Serve>::Resp>,
-		Bincode<
+		Json<
 			tarpc::ClientMessage<<<C as Compartment>::Server as Serve>::Req>,
 			tarpc::Response<<<C as Compartment>::Server as Serve>::Resp>,
 		>,
@@ -119,7 +118,7 @@ pub type CompartmentTransport<C, STR> = STransport<
 	STR,
 	tarpc::Response<<<C as Compartment>::Server as Serve>::Resp>,
 	tarpc::ClientMessage<<<C as Compartment>::Server as Serve>::Req>,
-	Bincode<
+	Json<
 		tarpc::Response<<<C as Compartment>::Server as Serve>::Resp>,
 		tarpc::ClientMessage<<<C as Compartment>::Server as Serve>::Req>,
 	>,
@@ -130,7 +129,7 @@ pub trait Compartment: Sized + Send + Sync {
 
 	type Error: Error + From<std::io::Error>;
 	fn setup(
-		&mut self,
+		server: &mut Self::Server,
 		mode: CompartmentMode,
 	) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + Sync;
 
@@ -143,7 +142,6 @@ pub trait Compartment: Sized + Send + Sync {
 	type Client: Send + Sync + 'static;
 
 	fn fork(
-		mut self,
 		server: impl FnOnce() -> Self::Server + Send + Sync,
 		client: impl FnOnce(CompartmentTransport<Self, UnixStream>) -> JoinHandle<Self::Client>,
 	) -> Result<impl Future<Output = Self::Client>, Self::Error>
@@ -166,10 +164,13 @@ pub trait Compartment: Sized + Send + Sync {
 				std::mem::forget(host);
 				let codec_builder = LengthDelimitedCodec::builder();
 				let framed = codec_builder.new_framed(guest);
-				let transport = tarpc::serde_transport::new(framed, Bincode::default());
+				let transport = tarpc::serde_transport::new(framed, Json::default());
 				let channel = BaseChannel::with_defaults(transport);
-				self.setup(CompartmentMode::Fork).await.unwrap();
-				Self::serve(server(), channel).await;
+				let mut server = server();
+				Self::setup(&mut server, CompartmentMode::Fork)
+					.await
+					.unwrap();
+				Self::serve(server, channel).await;
 				std::process::exit(0)
 			}),
 			_ => Ok(async move {
@@ -177,7 +178,7 @@ pub trait Compartment: Sized + Send + Sync {
 				let host = UnixStream::from_std(host).unwrap();
 				let codec_builder = LengthDelimitedCodec::builder();
 				let framed = codec_builder.new_framed(host);
-				let transport = serde_transport::new(framed, Bincode::default());
+				let transport = serde_transport::new(framed, Json::default());
 				client(transport).await.unwrap()
 			}),
 		}
@@ -214,7 +215,7 @@ pub trait Compartment: Sized + Send + Sync {
 				use tokio::net::UnixListener;
 				let listener = UnixListener::bind(path).unwrap();
 				let server = server();
-				listen_on(listener, Bincode::default)
+				listen_on(listener, Json::default)
 					.await
 					.unwrap()
 					.filter_map(|r| async { r.ok() })
@@ -233,14 +234,13 @@ pub trait Compartment: Sized + Send + Sync {
 				let stream = UnixStream::connect(path).await.unwrap();
 				let codec_builder = LengthDelimitedCodec::builder();
 				let framed = codec_builder.new_framed(stream);
-				let transport = serde_transport::new(framed, Bincode::default());
+				let transport = serde_transport::new(framed, Json::default());
 				client(transport).await.unwrap()
 			})
 		}
 	}
 
 	fn connect_to_stream<STR: AsyncRead + AsyncWrite + Send + Sync>(
-		&self,
 		client: impl FnOnce(CompartmentTransport<Self, STR>) -> JoinHandle<Self::Client>,
 		stream: STR,
 	) -> impl Future<Output = Self::Client>
@@ -252,13 +252,12 @@ pub trait Compartment: Sized + Send + Sync {
 		async move {
 			let codec_builder = LengthDelimitedCodec::builder();
 			let framed = codec_builder.new_framed(stream);
-			let transport = serde_transport::new(framed, Bincode::default());
+			let transport = serde_transport::new(framed, Json::default());
 			client(transport).await.unwrap()
 		}
 	}
 
 	fn connect_to_unix(
-		&self,
 		client: impl FnOnce(CompartmentTransport<Self, UnixStream>) -> JoinHandle<Self::Client>,
 		addr: impl AsRef<Path>,
 	) -> impl Future<Output = Self::Client>
@@ -269,12 +268,11 @@ pub trait Compartment: Sized + Send + Sync {
 	{
 		async move {
 			let stream = UnixStream::connect(addr).await.unwrap();
-			self.connect_to_stream(client, stream).await
+			Self::connect_to_stream(client, stream).await
 		}
 	}
 
 	fn connect_to_tcp(
-		&self,
 		client: impl FnOnce(CompartmentTransport<Self, TcpStream>) -> JoinHandle<Self::Client>,
 		addr: SocketAddr,
 	) -> impl Future<Output = Self::Client>
@@ -285,7 +283,7 @@ pub trait Compartment: Sized + Send + Sync {
 	{
 		async move {
 			let stream = TcpStream::connect(addr).await.unwrap();
-			self.connect_to_stream(client, stream).await
+			Self::connect_to_stream(client, stream).await
 		}
 	}
 
@@ -303,7 +301,7 @@ pub trait Compartment: Sized + Send + Sync {
 		async {
 			let codec_builder = LengthDelimitedCodec::builder();
 			let framed = codec_builder.new_framed(stream);
-			let transport = tarpc::serde_transport::new(framed, Bincode::default());
+			let transport = tarpc::serde_transport::new(framed, Json::default());
 			let channel = BaseChannel::with_defaults(transport);
 			Self::serve(server, channel).await;
 			std::process::exit(0)

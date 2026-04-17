@@ -1,0 +1,280 @@
+use dashmap::DashMap;
+use futures::{FutureExt, SinkExt, StreamExt};
+use rayon::prelude::*;
+use rhai::{Dynamic, Engine, Func, Scope};
+use rucompart::{
+	Compartment,
+	chan::{ChannelSpec, Many},
+	compartmentalize,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{
+	net::SocketAddr,
+	sync::{Arc, OnceLock},
+	time::Duration,
+};
+use tarpc::{serde_transport::Transport, tokio_serde::formats::Json};
+use tokio::{
+	net::TcpStream,
+	sync::{
+		Mutex,
+		mpsc::{Receiver, Sender},
+	},
+	task::JoinHandle,
+};
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum UpwardsMessage {
+	FilterMapReduceResult(Vec<Value>),
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum DownwardsMessage {
+	StartFilterMapReduce(String),
+}
+
+pub(crate) fn guest(addr: SocketAddr) {
+	let shard = ShardService {
+		inner: Arc::new(Mutex::new(ShardInner {
+			thread: OnceLock::new(),
+			upward: OnceLock::new(),
+			downward: vec![],
+		})),
+		store: Arc::new(DashMap::new()),
+		commands: Arc::new(OnceLock::new()),
+		responses: Arc::new(Mutex::new(tokio::sync::mpsc::channel(1).1)),
+	};
+	let server = shard.clone();
+	shard.listen_on_tcp(server.serve(), addr)
+}
+
+#[tarpc::service]
+pub(crate) trait Shard {
+	async fn start();
+	async fn set_upstream(upstream: ChannelSpec<(), Many, UpwardsMessage, DownwardsMessage>);
+	async fn get_downstream() -> ChannelSpec<(), Many, UpwardsMessage, DownwardsMessage>;
+	async fn store(key: String, value: Value) -> Option<Value>;
+	async fn load(key: String) -> Option<Value>;
+	/// Takes Rhai source code.
+	/// Only makes sense on shard 0.
+	async fn filter_map_reduce(program: String) -> Value;
+}
+
+#[derive(Clone)]
+pub(crate) struct ShardService {
+	pub(crate) inner: Arc<Mutex<ShardInner>>,
+	pub(crate) store: Arc<DashMap<String, Value>>,
+	pub(crate) commands: Arc<OnceLock<Sender<DownwardsMessage>>>,
+	pub(crate) responses: Arc<Mutex<Receiver<UpwardsMessage>>>,
+}
+
+pub(crate) struct ShardInner {
+	pub(crate) thread: OnceLock<JoinHandle<()>>,
+	pub(crate) upward: OnceLock<
+		Transport<
+			TcpStream,
+			DownwardsMessage,
+			UpwardsMessage,
+			Json<DownwardsMessage, UpwardsMessage>,
+		>,
+	>,
+	pub(crate) downward: Vec<
+		Transport<
+			TcpStream,
+			UpwardsMessage,
+			DownwardsMessage,
+			Json<UpwardsMessage, DownwardsMessage>,
+		>,
+	>,
+}
+
+pub(crate) async fn shard_daemon(
+	inner: Arc<Mutex<ShardInner>>,
+	store: Arc<DashMap<String, Value>>,
+	mut server_commands: Receiver<DownwardsMessage>,
+	server_responses: Sender<UpwardsMessage>,
+) {
+	loop {
+		let mut inner = inner.lock().await;
+		async fn downwards_message(
+			inner: &mut ShardInner,
+			msg: DownwardsMessage,
+			store: &DashMap<String, Value>,
+		) -> Option<UpwardsMessage> {
+			match msg {
+				DownwardsMessage::StartFilterMapReduce(source) => {
+					for downward in inner.downward.iter_mut() {
+						let _ = downward
+							.send(DownwardsMessage::StartFilterMapReduce(source.clone()))
+							.await;
+					}
+					let engine = Engine::new();
+					let ast = engine.compile(source).unwrap();
+					let filter = Func::<(String, Dynamic), bool>::create_from_ast(
+						Engine::new(),
+						ast.clone(),
+						"filter",
+					);
+					let map = Func::<(Dynamic,), Dynamic>::create_from_ast(
+						Engine::new(),
+						ast.clone(),
+						"map",
+					);
+					let reduce = Func::<(Dynamic, Dynamic), Dynamic>::create_from_ast(
+						Engine::new(),
+						ast.clone(),
+						"reduce",
+					);
+					let reduce = |l: Dynamic, r: Dynamic| -> Dynamic {
+						match (l.is_unit(), r.is_unit()) {
+							(true, true) => Dynamic::UNIT,
+							(true, false) => r,
+							(false, true) => l,
+							(false, false) => reduce(l, r).unwrap(),
+						}
+					};
+					let result = store
+						.par_iter()
+						.filter_map(|kv| {
+							filter(
+								kv.key().clone(),
+								rhai::serde::to_dynamic(kv.value()).unwrap(),
+							)
+							.unwrap()
+							.then(|| kv.value().clone())
+						})
+						.map(|v| map(rhai::serde::to_dynamic(v).unwrap()).unwrap())
+						.reduce_with(&reduce);
+					let mut received = vec![];
+					for downward in inner.downward.iter_mut() {
+						let Some(Ok(UpwardsMessage::FilterMapReduceResult(msg))) =
+							downward.next().await
+						else {
+							continue;
+						};
+						received.extend(msg);
+					}
+					let result = result
+						.into_par_iter()
+						.map(|v| rhai::serde::from_dynamic::<Value>(&v).unwrap())
+						.chain(received)
+						.map(|v| rhai::serde::to_dynamic(&v).unwrap())
+						.reduce_with(reduce)
+						.unwrap_or_default();
+					Some(UpwardsMessage::FilterMapReduceResult(vec![
+						rhai::serde::from_dynamic(&result).unwrap(),
+					]))
+				}
+			}
+		}
+		tokio::select! {
+			_ = tokio::time::sleep(Duration::from_millis(10)) => {}
+			msg = async {
+				if let Some(upward) = inner.upward.get_mut() {
+					upward.next().await
+				} else {
+					tokio::time::sleep(Duration::from_secs(10000000)).await; unreachable!()
+				}} => if let Some(Ok(msg)) = msg {
+				let response = tokio::select! {
+					msg = downwards_message(&mut inner, msg, &store) => msg,
+					_ = tokio::time::sleep(Duration::from_secs(1)) => None
+				};
+				if let Some(response) = response {inner.upward.get_mut().unwrap().send(response).await.unwrap();}
+			},
+			msg = server_commands.recv() => if let Some(msg) = msg {
+				let response = tokio::select! {
+					msg = downwards_message(&mut inner, msg, &store) => msg,
+					_ = tokio::time::sleep(Duration::from_secs(1)) => None
+				};
+				if let Some(response) = response {server_responses.send(response).await.unwrap();}
+			}
+		}
+	}
+}
+
+impl Shard for ShardService {
+	async fn start(self, context: ::tarpc::context::Context) {
+		let (command_sender, command_receiver) = tokio::sync::mpsc::channel(1);
+		let (response_sender, response_receiver) = tokio::sync::mpsc::channel(1);
+		self.commands
+			.set(command_sender)
+			.expect("Must not run start twice");
+		*self.responses.lock().await = response_receiver;
+		let inner = self.inner.lock().await;
+		inner
+			.thread
+			.set(tokio::task::spawn(shard_daemon(
+				self.inner.clone(),
+				self.store.clone(),
+				command_receiver,
+				response_sender,
+			)))
+			.unwrap()
+	}
+
+	async fn set_upstream(
+		self,
+		context: ::tarpc::context::Context,
+		upstream: ChannelSpec<(), Many, UpwardsMessage, DownwardsMessage>,
+	) -> () {
+		let stream = upstream.connect().await.unwrap();
+		let _ = self.inner.lock().await.upward.set(stream.inner);
+	}
+
+	async fn get_downstream(
+		self,
+		context: ::tarpc::context::Context,
+	) -> ChannelSpec<(), Many, UpwardsMessage, DownwardsMessage> {
+		let (connection, spec) = rucompart::chan::channel().await.unwrap();
+		let inner_lock = self.inner.clone();
+		tokio::task::spawn(async move {
+			let connection = connection.await;
+			inner_lock.lock().await.downward.push(connection);
+		});
+		spec
+	}
+
+	async fn store(
+		self,
+		context: ::tarpc::context::Context,
+		key: String,
+		value: Value,
+	) -> Option<Value> {
+		self.store.insert(key, value)
+	}
+
+	async fn load(self, context: ::tarpc::context::Context, key: String) -> Option<Value> {
+		self.store.get(&key).map(|v| v.clone())
+	}
+
+	#[doc = " Takes Rhai source code."]
+	#[doc = " Only makes sense on shard 0."]
+	async fn filter_map_reduce(self, context: ::tarpc::context::Context, program: String) -> Value {
+		self.commands
+			.get()
+			.unwrap()
+			.send(DownwardsMessage::StartFilterMapReduce(program))
+			.await
+			.unwrap();
+		let Some(UpwardsMessage::FilterMapReduceResult(result)) =
+			self.responses.lock().await.recv().await
+		else {
+			panic!("Protocol error!");
+		};
+		result.first().cloned().unwrap_or_default()
+	}
+}
+
+compartmentalize!(
+	"SHARD",
+	ServeShard,
+	ShardService,
+	ShardClient,
+	async fn setup(
+		service: &mut Self::Server,
+		mode: rucompart::CompartmentMode,
+	) -> Result<_, std::io::Error> {
+		Ok(())
+	}
+);
