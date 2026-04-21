@@ -4,7 +4,7 @@ use rayon::prelude::*;
 use rhai::{Dynamic, Engine, Func, Scope};
 use rucompart::{
 	Compartment,
-	chan::{ChannelSpec, Many},
+	chan::{ChannelSpec, EstablishedChannel, Many},
 	compartmentalize,
 };
 use serde::{Deserialize, Serialize};
@@ -71,22 +71,8 @@ pub(crate) struct ShardService {
 
 pub(crate) struct ShardInner {
 	pub(crate) thread: OnceLock<JoinHandle<()>>,
-	pub(crate) upward: OnceLock<
-		Transport<
-			TcpStream,
-			DownwardsMessage,
-			UpwardsMessage,
-			Json<DownwardsMessage, UpwardsMessage>,
-		>,
-	>,
-	pub(crate) downward: Vec<
-		Transport<
-			TcpStream,
-			UpwardsMessage,
-			DownwardsMessage,
-			Json<UpwardsMessage, DownwardsMessage>,
-		>,
-	>,
+	pub(crate) upward: OnceLock<EstablishedChannel<Many, UpwardsMessage, DownwardsMessage>>,
+	pub(crate) downward: Vec<EstablishedChannel<Many, DownwardsMessage, UpwardsMessage>>,
 }
 
 pub(crate) async fn shard_daemon(
@@ -148,8 +134,8 @@ pub(crate) async fn shard_daemon(
 						.reduce_with(&reduce);
 					let mut received = vec![];
 					for downward in inner.downward.iter_mut() {
-						let Some(Ok(UpwardsMessage::FilterMapReduceResult(msg))) =
-							downward.next().await
+						let Some(UpwardsMessage::FilterMapReduceResult(msg)) =
+							downward.recv().await
 						else {
 							continue;
 						};
@@ -172,10 +158,10 @@ pub(crate) async fn shard_daemon(
 			_ = tokio::time::sleep(Duration::from_millis(10)) => {}
 			msg = async {
 				if let Some(upward) = inner.upward.get_mut() {
-					upward.next().await
+					upward.recv().await
 				} else {
 					tokio::time::sleep(Duration::from_secs(10000000)).await; unreachable!()
-				}} => if let Some(Ok(msg)) = msg {
+				}} => if let Some(msg) = msg {
 				let response = tokio::select! {
 					msg = downwards_message(&mut inner, msg, &store) => msg,
 					_ = tokio::time::sleep(Duration::from_secs(1)) => None
@@ -219,7 +205,7 @@ impl Shard for ShardService {
 		upstream: ChannelSpec<(), Many, UpwardsMessage, DownwardsMessage>,
 	) -> () {
 		let stream = upstream.connect().await.unwrap();
-		let _ = self.inner.lock().await.upward.set(stream.inner);
+		let _ = self.inner.lock().await.upward.set(stream);
 	}
 
 	async fn get_downstream(

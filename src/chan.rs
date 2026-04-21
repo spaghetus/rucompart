@@ -78,13 +78,14 @@ impl<
 	}
 }
 
+pub type EstablishedChannel<K, S, R> = ChannelSpec<Transport<TcpStream, R, S, Json<R, S>>, K, S, R>;
+
 #[allow(private_bounds)]
 impl<
 	K: ChannelKind,
 	S: Serialize + Send + Sync + Unpin + 'static,
 	R: for<'de> Deserialize<'de> + Send + Sync + Unpin + 'static,
-> From<Transport<TcpStream, R, S, Json<R, S>>>
-	for ChannelSpec<Transport<TcpStream, R, S, Json<R, S>>, K, S, R>
+> From<Transport<TcpStream, R, S, Json<R, S>>> for EstablishedChannel<K, S, R>
 {
 	fn from(transport: Transport<TcpStream, R, S, Json<R, S>>) -> Self {
 		Self {
@@ -126,12 +127,12 @@ impl<
 }
 
 pub async fn channel<
-	R: Serialize + DeserializeOwned,
-	S: Serialize + DeserializeOwned,
+	R: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static,
+	S: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static,
 	K: ChannelKind,
 >() -> Result<
 	(
-		impl Future<Output = Transport<TcpStream, R, S, Json<R, S>>>,
+		impl Future<Output = EstablishedChannel<K, S, R>>,
 		ChannelSpec<(), K, R, S>,
 	),
 	ChannelError,
@@ -159,7 +160,7 @@ pub async fn channel<
 					let codec_builder = LengthDelimitedCodec::builder();
 					let framed = codec_builder.new_framed(stream);
 					let transport = tarpc::serde_transport::new(framed, Json::default());
-					return transport;
+					return EstablishedChannel::from(transport);
 				}
 				Err(e) => {
 					eprintln!("Listening error {e}");
