@@ -23,6 +23,7 @@ use tokio::{
 	},
 	task::JoinHandle,
 };
+use tracing::{instrument, trace};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum UpwardsMessage {
@@ -75,6 +76,7 @@ pub(crate) struct ShardInner {
 	pub(crate) downward: Vec<EstablishedChannel<Many, DownwardsMessage, UpwardsMessage>>,
 }
 
+#[instrument(skip(inner, store, server_commands, server_responses))]
 pub(crate) async fn shard_daemon(
 	inner: Arc<Mutex<ShardInner>>,
 	store: Arc<DashMap<String, Value>>,
@@ -82,19 +84,24 @@ pub(crate) async fn shard_daemon(
 	server_responses: Sender<UpwardsMessage>,
 ) {
 	loop {
+		trace!("Waiting for horizontal message...");
 		let mut inner = inner.lock().await;
+		#[instrument(skip(inner, store))]
 		async fn downwards_message(
 			inner: &mut ShardInner,
 			msg: DownwardsMessage,
 			store: &DashMap<String, Value>,
 		) -> Option<UpwardsMessage> {
+			trace!("Got horizontal message!");
 			match msg {
 				DownwardsMessage::StartFilterMapReduce(source) => {
+					trace!("It's a map-reduce operation. Propagate down...");
 					for downward in inner.downward.iter_mut() {
 						let _ = downward
 							.send(DownwardsMessage::StartFilterMapReduce(source.clone()))
 							.await;
 					}
+					trace!("Preparing script...");
 					let engine = Engine::new();
 					let ast = engine.compile(source).unwrap();
 					let filter = Func::<(String, Dynamic), bool>::create_from_ast(
@@ -120,6 +127,7 @@ pub(crate) async fn shard_daemon(
 							(false, false) => reduce(l, r).unwrap(),
 						}
 					};
+					trace!("Working on local data...");
 					let result = store
 						.par_iter()
 						.filter_map(|kv| {
@@ -132,6 +140,7 @@ pub(crate) async fn shard_daemon(
 						})
 						.map(|v| map(rhai::serde::to_dynamic(v).unwrap()).unwrap())
 						.reduce_with(&reduce);
+					trace!("Collecting incoming data...");
 					let mut received = vec![];
 					for downward in inner.downward.iter_mut() {
 						let Some(UpwardsMessage::FilterMapReduceResult(msg)) =
@@ -141,6 +150,7 @@ pub(crate) async fn shard_daemon(
 						};
 						received.extend(msg);
 					}
+					trace!("Combining...");
 					let result = result
 						.into_par_iter()
 						.map(|v| rhai::serde::from_dynamic::<Value>(&v).unwrap())
@@ -148,6 +158,10 @@ pub(crate) async fn shard_daemon(
 						.map(|v| rhai::serde::to_dynamic(&v).unwrap())
 						.reduce_with(reduce)
 						.unwrap_or_default();
+					trace!(
+						"Done! Passing up the chain. Here's the data so far:\n{:#?}",
+						result
+					);
 					Some(UpwardsMessage::FilterMapReduceResult(vec![
 						rhai::serde::from_dynamic(&result).unwrap(),
 					]))
@@ -234,8 +248,8 @@ impl Shard for ShardService {
 		self.store.get(&key).map(|v| v.clone())
 	}
 
-	#[doc = " Takes Rhai source code."]
-	#[doc = " Only makes sense on shard 0."]
+	/// Takes Rhai source code.
+	/// Only makes sense on shard 0.
 	async fn filter_map_reduce(self, context: ::tarpc::context::Context, program: String) -> Value {
 		self.commands
 			.get()

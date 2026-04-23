@@ -12,11 +12,14 @@ use rucompart::compartment_connect;
 use serde_json::Value;
 use tarpc::context::Context;
 use tokio::{runtime::Runtime, task::JoinSet};
+use tracing::{Instrument, Level, Span, debug, instrument, level_filters::LevelFilter, trace};
 
 mod shard;
 
 #[derive(Parser)]
 struct Args {
+	#[arg(short, default_value = "info")]
+	verbosity: LevelFilter,
 	#[command(subcommand)]
 	mode: DbMode,
 }
@@ -33,7 +36,8 @@ enum DbMode {
 }
 
 fn main() {
-	let Args { mode } = Args::parse();
+	let Args { mode, verbosity } = Args::parse();
+	tracing_subscriber::fmt().with_max_level(verbosity).finish();
 
 	match mode {
 		DbMode::Host { shards } => Runtime::new().unwrap().block_on(host(shards)),
@@ -41,6 +45,7 @@ fn main() {
 	}
 }
 
+#[instrument]
 async fn host(shards: Vec<SocketAddr>) {
 	let shards = shards
 		.into_iter()
@@ -54,16 +59,23 @@ async fn host(shards: Vec<SocketAddr>) {
 		})
 		.collect::<JoinSet<_>>()
 		.join_all()
+		.instrument(Span::current())
 		.await;
+	#[instrument]
 	async fn assign_upstream(shards: &[ShardClient]) {
 		let [left, rest @ ..] = shards else { return };
 		if rest.is_empty() {
 			return;
 		}
 		if rest.len() == 1 {
-			let upstream = left.get_downstream(Context::current()).await.unwrap();
+			let upstream = left
+				.get_downstream(Context::current())
+				.instrument(Span::current())
+				.await
+				.unwrap();
 			rest[0]
 				.set_upstream(Context::current(), upstream)
+				.instrument(Span::current())
 				.await
 				.unwrap();
 		}
@@ -74,6 +86,7 @@ async fn host(shards: Vec<SocketAddr>) {
 					Context::current(),
 					left.get_downstream(Context::current()).await.unwrap(),
 				)
+				.instrument(Span::current())
 				.await
 				.unwrap();
 		}
@@ -83,15 +96,24 @@ async fn host(shards: Vec<SocketAddr>) {
 					Context::current(),
 					left.get_downstream(Context::current()).await.unwrap(),
 				)
+				.instrument(Span::current())
 				.await
 				.unwrap();
 		}
-		Box::pin(assign_upstream(left_shards)).await;
-		Box::pin(assign_upstream(right_shards)).await;
+		Box::pin(assign_upstream(left_shards))
+			.instrument(Span::current())
+			.await;
+		Box::pin(assign_upstream(right_shards))
+			.instrument(Span::current())
+			.await;
 	}
 	assign_upstream(&shards).await;
 	for shard in &shards {
-		shard.start(Context::current()).await.unwrap()
+		shard
+			.start(Context::current())
+			.instrument(Span::current())
+			.await
+			.unwrap()
 	}
 
 	rocket::build()
@@ -103,6 +125,7 @@ async fn host(shards: Vec<SocketAddr>) {
 }
 
 #[get("/<key>")]
+#[instrument(skip(shards))]
 async fn get_value(key: String, shards: &State<Vec<ShardClient>>) -> (Status, Option<Json<Value>>) {
 	let mut hasher = DefaultHasher::new();
 	hasher.write(key.as_bytes());
@@ -120,6 +143,7 @@ async fn get_value(key: String, shards: &State<Vec<ShardClient>>) -> (Status, Op
 }
 
 #[post("/<key>", data = "<data>")]
+#[instrument(skip(shards))]
 async fn put_value(
 	key: String,
 	shards: &State<Vec<ShardClient>>,
@@ -146,6 +170,7 @@ async fn put_value(
 }
 
 #[post("/", data = "<source>")]
+#[instrument(skip(shards, source))]
 async fn map_reduce(
 	shards: &State<Vec<ShardClient>>,
 	source: String,
