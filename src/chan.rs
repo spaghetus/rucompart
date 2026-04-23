@@ -13,7 +13,7 @@ use tokio::{
 };
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct ChannelSpec<C, K, S, R> {
+pub struct Channel<C, K, S, R> {
 	pub addresses: Vec<SocketAddr>,
 	pub inner: C,
 	_state: PhantomData<(K, S, R)>,
@@ -37,8 +37,11 @@ pub trait ChannelKind {}
 impl ChannelKind for Once {}
 impl ChannelKind for Many {}
 
+pub type EstablishedChannel<K, S, R> = Channel<Transport<TcpStream, R, S, Json<R, S>>, K, S, R>;
+pub type PlannedChannel<K, S, R> = Channel<(), K, S, R>;
+
 #[allow(private_bounds)]
-impl<K: ChannelKind, S, R> ChannelSpec<(), K, S, R> {
+impl<K: ChannelKind, S, R> Channel<(), K, S, R> {
 	pub fn new(addresses: Vec<SocketAddr>) -> Self {
 		Self {
 			addresses,
@@ -52,11 +55,11 @@ impl<
 	K: ChannelKind,
 	S: Serialize + Send + Sync + Unpin + 'static,
 	R: for<'de> Deserialize<'de> + Send + Sync + Unpin + 'static,
-> ChannelSpec<(), K, S, R>
+> Channel<(), K, S, R>
 {
 	pub async fn connect(
 		self,
-	) -> Result<ChannelSpec<Transport<TcpStream, R, S, Json<R, S>>, K, S, R>, ChannelError> {
+	) -> Result<Channel<Transport<TcpStream, R, S, Json<R, S>>, K, S, R>, ChannelError> {
 		let stream = TcpStream::connect(self.addresses.as_slice()).await?;
 		//  Box::pin(
 		// 	futures::stream::iter(self.addresses.iter())
@@ -70,15 +73,13 @@ impl<
 		let framed = codec_builder.new_framed(stream);
 		let transport = tarpc::serde_transport::new(framed, Json::default());
 
-		Ok(ChannelSpec {
+		Ok(Channel {
 			addresses: self.addresses,
 			inner: transport,
 			_state: PhantomData,
 		})
 	}
 }
-
-pub type EstablishedChannel<K, S, R> = ChannelSpec<Transport<TcpStream, R, S, Json<R, S>>, K, S, R>;
 
 #[allow(private_bounds)]
 impl<
@@ -99,7 +100,7 @@ impl<
 impl<
 	S: Serialize + Send + Sync + Unpin + 'static,
 	R: for<'de> Deserialize<'de> + Send + Sync + Unpin + 'static,
-> ChannelSpec<Transport<TcpStream, R, S, Json<R, S>>, Once, S, R>
+> Channel<Transport<TcpStream, R, S, Json<R, S>>, Once, S, R>
 {
 	pub async fn send(mut self, item: S) -> Result<(), std::io::Error> {
 		self.inner.send(item).await?;
@@ -114,7 +115,7 @@ impl<
 impl<
 	S: Serialize + Send + Sync + Unpin + 'static,
 	R: for<'de> Deserialize<'de> + Send + Sync + Unpin + 'static,
-> ChannelSpec<Transport<TcpStream, R, S, Json<R, S>>, Many, S, R>
+> Channel<Transport<TcpStream, R, S, Json<R, S>>, Many, S, R>
 {
 	pub async fn send(&mut self, item: S) -> Result<(), std::io::Error> {
 		self.inner.send(item).await?;
@@ -127,13 +128,13 @@ impl<
 }
 
 pub async fn channel<
+	K: ChannelKind,
 	R: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static,
 	S: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static,
-	K: ChannelKind,
 >() -> Result<
 	(
 		impl Future<Output = EstablishedChannel<K, S, R>>,
-		ChannelSpec<(), K, R, S>,
+		Channel<(), K, R, S>,
 	),
 	ChannelError,
 > {
@@ -144,7 +145,7 @@ pub async fn channel<
 		.filter_map(|conn| async move { conn.ok() })
 		.collect()
 		.await;
-	let channel_spec = ChannelSpec {
+	let channel_spec = Channel {
 		_state: PhantomData,
 		addresses: listeners.iter().map(|l| l.local_addr().unwrap()).collect(),
 		inner: (),

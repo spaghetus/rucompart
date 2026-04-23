@@ -56,6 +56,17 @@ macro_rules! compartmentalize {
 }
 
 #[macro_export]
+macro_rules! client_thunk {
+	($client:ty) => {
+		|transport| {
+			tokio::spawn(async {
+				<$client>::new(tarpc::client::Config::default(), transport).spawn()
+			})
+		}
+	};
+}
+
+#[macro_export]
 macro_rules! compartment_connect {
 	($addr:expr, $service:ty, $server:expr, $client:ty) => {{
 		use futures::FutureExt;
@@ -64,38 +75,15 @@ macro_rules! compartment_connect {
 		addr.map(|addr| {
 			use std::str::FromStr;
 			if let Ok(addr) = std::net::SocketAddr::from_str(&addr) {
-				<$service>::connect_to_tcp(
-					|transport| {
-						tokio::spawn(async {
-							<$client>::new(tarpc::client::Config::default(), transport).spawn()
-						})
-					},
-					addr,
-				)
-				.boxed()
+				<$service>::connect_to_tcp(rucompart::client_thunk!($client), addr).boxed()
 			} else {
-				<$service>::connect_to_unix(
-					|transport| {
-						tokio::spawn(async {
-							<$client>::new(tarpc::client::Config::default(), transport).spawn()
-						})
-					},
-					addr,
-				)
-				.boxed()
+				<$service>::connect_to_unix(rucompart::client_thunk!($client), addr).boxed()
 			}
 		})
 		.unwrap_or_else(|| {
-			<$service>::fork(
-				|| ($server)(),
-				|transport| {
-					tokio::spawn(async {
-						<$client>::new(tarpc::client::Config::default(), transport).spawn()
-					})
-				},
-			)
-			.unwrap()
-			.boxed()
+			<$service>::fork(|| ($server)(), rucompart::client_thunk!($client))
+				.unwrap()
+				.boxed()
 		})
 	}};
 }

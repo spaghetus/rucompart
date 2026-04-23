@@ -4,7 +4,7 @@ use rayon::prelude::*;
 use rhai::{Dynamic, Engine, Func, Scope};
 use rucompart::{
 	Compartment,
-	chan::{ChannelSpec, EstablishedChannel, Many},
+	chan::{Channel, EstablishedChannel, Many},
 	compartmentalize,
 };
 use serde::{Deserialize, Serialize};
@@ -52,8 +52,8 @@ pub(crate) fn guest(addr: SocketAddr) {
 #[tarpc::service]
 pub(crate) trait Shard {
 	async fn start();
-	async fn set_upstream(upstream: ChannelSpec<(), Many, UpwardsMessage, DownwardsMessage>);
-	async fn get_downstream() -> ChannelSpec<(), Many, UpwardsMessage, DownwardsMessage>;
+	async fn set_upstream(upstream: Channel<(), Many, UpwardsMessage, DownwardsMessage>);
+	async fn get_downstream() -> Channel<(), Many, UpwardsMessage, DownwardsMessage>;
 	async fn store(key: String, value: Value) -> Option<Value>;
 	async fn load(key: String) -> Option<Value>;
 	/// Takes Rhai source code.
@@ -202,7 +202,7 @@ impl Shard for ShardService {
 	async fn set_upstream(
 		self,
 		context: ::tarpc::context::Context,
-		upstream: ChannelSpec<(), Many, UpwardsMessage, DownwardsMessage>,
+		upstream: Channel<(), Many, UpwardsMessage, DownwardsMessage>,
 	) -> () {
 		let stream = upstream.connect().await.unwrap();
 		let _ = self.inner.lock().await.upward.set(stream);
@@ -211,7 +211,7 @@ impl Shard for ShardService {
 	async fn get_downstream(
 		self,
 		context: ::tarpc::context::Context,
-	) -> ChannelSpec<(), Many, UpwardsMessage, DownwardsMessage> {
+	) -> Channel<(), Many, UpwardsMessage, DownwardsMessage> {
 		let (connection, spec) = rucompart::chan::channel().await.unwrap();
 		let inner_lock = self.inner.clone();
 		tokio::task::spawn(async move {
