@@ -2,6 +2,7 @@ use std::{
 	hash::{DefaultHasher, Hasher},
 	net::SocketAddr,
 	ops::Rem,
+	time::{Duration, Instant},
 };
 
 use crate::shard::{ShardClient, ShardService};
@@ -61,20 +62,23 @@ async fn host(shards: Vec<SocketAddr>) {
 		.join_all()
 		.instrument(Span::current())
 		.await;
-	#[instrument]
+	#[instrument(skip(shards))]
 	async fn assign_upstream(shards: &[ShardClient]) {
+		let mut ctx = Context::current();
+		dbg!(ctx.deadline - Instant::now());
+		ctx.deadline = Instant::now() + Duration::from_secs(60);
 		let [left, rest @ ..] = shards else { return };
 		if rest.is_empty() {
 			return;
 		}
 		if rest.len() == 1 {
 			let upstream = left
-				.get_downstream(Context::current())
+				.get_downstream(ctx)
 				.instrument(Span::current())
 				.await
 				.unwrap();
 			rest[0]
-				.set_upstream(Context::current(), upstream)
+				.set_upstream(ctx, upstream)
 				.instrument(Span::current())
 				.await
 				.unwrap();
@@ -82,20 +86,14 @@ async fn host(shards: Vec<SocketAddr>) {
 		let (left_shards, right_shards) = rest.split_at(rest.len() / 2);
 		if let Some(left_leaf) = left_shards.first() {
 			left_leaf
-				.set_upstream(
-					Context::current(),
-					left.get_downstream(Context::current()).await.unwrap(),
-				)
+				.set_upstream(ctx, left.get_downstream(ctx).await.unwrap())
 				.instrument(Span::current())
 				.await
 				.unwrap();
 		}
 		if let Some(right_leaf) = right_shards.first() {
 			right_leaf
-				.set_upstream(
-					Context::current(),
-					left.get_downstream(Context::current()).await.unwrap(),
-				)
+				.set_upstream(ctx, left.get_downstream(ctx).await.unwrap())
 				.instrument(Span::current())
 				.await
 				.unwrap();
