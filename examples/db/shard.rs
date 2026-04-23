@@ -35,7 +35,9 @@ pub enum DownwardsMessage {
 	StartFilterMapReduce(String),
 }
 
+#[instrument]
 pub(crate) fn guest(addr: SocketAddr) {
+	trace!("Initializing...");
 	let shard = ShardService {
 		inner: Arc::new(Mutex::new(ShardInner {
 			thread: OnceLock::new(),
@@ -47,6 +49,7 @@ pub(crate) fn guest(addr: SocketAddr) {
 		responses: Arc::new(Mutex::new(tokio::sync::mpsc::channel(1).1)),
 	};
 	let server = shard.clone();
+	trace!("Listening...");
 	shard.listen_on_tcp(server.serve(), addr)
 }
 
@@ -124,7 +127,7 @@ pub(crate) async fn shard_daemon(
 							(true, true) => Dynamic::UNIT,
 							(true, false) => r,
 							(false, true) => l,
-							(false, false) => reduce(l, r).unwrap(),
+							(false, false) => reduce(l, r).unwrap_or_default(),
 						}
 					};
 					trace!("Working on local data...");
@@ -135,10 +138,10 @@ pub(crate) async fn shard_daemon(
 								kv.key().clone(),
 								rhai::serde::to_dynamic(kv.value()).unwrap(),
 							)
-							.unwrap()
+							.unwrap_or_default()
 							.then(|| kv.value().clone())
 						})
-						.map(|v| map(rhai::serde::to_dynamic(v).unwrap()).unwrap())
+						.map(|v| map(rhai::serde::to_dynamic(v).unwrap()).unwrap_or_default())
 						.reduce_with(&reduce);
 					trace!("Collecting incoming data...");
 					let mut received = vec![];
