@@ -13,8 +13,6 @@ use serde_json::Value;
 use tarpc::context::Context;
 use tokio::{runtime::Runtime, task::JoinSet};
 use tracing::{Instrument, Level, Span, debug, instrument, level_filters::LevelFilter, trace};
-use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
-use tracing_systemd::SystemdLayer;
 
 mod shard;
 
@@ -39,16 +37,7 @@ enum DbMode {
 
 fn main() {
 	let Args { mode, verbosity } = Args::parse();
-	tracing_subscriber::registry()
-		.with(
-			SystemdLayer::new()
-				.with_target(true)
-				.use_level_prefix(false)
-				.use_color(true)
-				.with_thread_ids(true)
-				.with_filter(verbosity),
-		)
-		.init();
+	tracing_subscriber::fmt().with_max_level(verbosity).finish();
 
 	match mode {
 		DbMode::Host { shards } => Runtime::new().unwrap().block_on(host(shards)),
