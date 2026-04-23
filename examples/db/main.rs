@@ -66,7 +66,7 @@ async fn host(shards: Vec<SocketAddr>) {
 	async fn assign_upstream(shards: &[ShardClient]) {
 		let mut ctx = Context::current();
 		dbg!(ctx.deadline - Instant::now());
-		ctx.deadline = Instant::now() + Duration::from_secs(60);
+		ctx.deadline = Instant::now() + Duration::from_secs(6000);
 		let [left, rest @ ..] = shards else { return };
 		if rest.is_empty() {
 			return;
