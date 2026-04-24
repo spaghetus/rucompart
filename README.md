@@ -1,6 +1,6 @@
 # Rucompart
 
-[Demo](https://u.wolo.dev/~willow/rucompart-demo.mp4?k=Oj_Y7EeT)
+[Video Demo](https://u.wolo.dev/~willow/pub/rucompart-final-demo.mp4)
 
 ## Usage
 
