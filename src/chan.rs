@@ -84,6 +84,7 @@ impl<
 				None => return Err(ChannelError::CouldntConnect),
 			}
 		};
+		streams.abort_all();
 		let codec_builder = LengthDelimitedCodec::builder();
 		let framed = codec_builder.new_framed(stream);
 		let transport = tarpc::serde_transport::new(framed, Json::default());
@@ -184,6 +185,7 @@ pub async fn channel<
 					let codec_builder = LengthDelimitedCodec::builder();
 					let framed = codec_builder.new_framed(stream);
 					let transport = tarpc::serde_transport::new(framed, Json::default());
+					connection.abort_all();
 					return EstablishedChannel::from(transport);
 				}
 				Err(e) => {
