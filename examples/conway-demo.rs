@@ -1,4 +1,5 @@
-use std::{io::stdin, sync::Arc, time::Duration};
+#![warn(clippy::pedantic)]
+use std::{io::stdin, sync::Arc};
 
 use itertools::Itertools;
 use ndarray::Array2;
@@ -27,14 +28,11 @@ impl Game {
 				.cartesian_product(-1isize..=1)
 				.filter(|p| *p != (0, 0))
 				.filter_map(|(dy, dx)| Some((y.checked_add_signed(dy)?, x.checked_add_signed(dx)?)))
-				.map(|p| left.get(p).map(|v| *v as u8).unwrap_or(0))
+				.map(|p| left.get(p).map_or(0, |v| u8::from(*v)))
 				.sum();
 			*v = match (left[(y, x)], count) {
-				(true, ..2) => false,
-				(true, 2..=3) => true,
-				(true, 4..) => false,
-				(false, 3) => true,
-				(false, _) => false,
+				(true, 2..=3) | (false, 3) => true,
+				(true, ..2 | 4..) | (false, _) => false,
 			};
 		});
 		std::mem::swap(left, right);
@@ -56,7 +54,7 @@ struct RGameImpl(Arc<Mutex<Game>>);
 
 impl RGame for RGameImpl {
 	async fn init(self, _context: ::tarpc::context::Context, state: Array2<bool>) -> () {
-		*self.0.lock().await = Game::from(state)
+		*self.0.lock().await = Game::from(state);
 	}
 
 	async fn tick(self, _context: ::tarpc::context::Context) -> () {

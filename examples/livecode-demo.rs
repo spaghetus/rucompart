@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic)]
 // Create a `tarpc` service schema
 use tarpc::service;
 
@@ -19,19 +20,19 @@ struct ArithmeticService;
 
 // ...And this is its implementation of the service.
 impl Arithmetic for ArithmeticService {
-	async fn add(self, context: ::tarpc::context::Context, a: i64, b: i64) -> i64 {
+	async fn add(self, _context: ::tarpc::context::Context, a: i64, b: i64) -> i64 {
 		a + b
 	}
 
-	async fn sub(self, context: ::tarpc::context::Context, a: i64, b: i64) -> i64 {
+	async fn sub(self, _context: ::tarpc::context::Context, a: i64, b: i64) -> i64 {
 		a - b
 	}
 
-	async fn mul(self, context: ::tarpc::context::Context, a: i64, b: i64) -> i64 {
+	async fn mul(self, _context: ::tarpc::context::Context, a: i64, b: i64) -> i64 {
 		a * b
 	}
 
-	async fn div(self, context: ::tarpc::context::Context, a: i64, b: i64) -> i64 {
+	async fn div(self, _context: ::tarpc::context::Context, a: i64, b: i64) -> i64 {
 		a / b
 	}
 }

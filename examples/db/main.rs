@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic)]
 use std::{
 	hash::{DefaultHasher, Hasher},
 	net::SocketAddr,
@@ -7,14 +8,13 @@ use std::{
 
 use crate::shard::{ShardClient, ShardService};
 use clap::{Parser, Subcommand};
-use futures::StreamExt;
 use rhai::Engine;
 use rocket::{State, get, http::Status, post, routes, serde::json::Json};
 use rucompart::compartment_connect;
 use serde_json::Value;
 use tarpc::context::Context;
 use tokio::{runtime::Runtime, task::JoinSet};
-use tracing::{Instrument, Level, Span, debug, instrument, level_filters::LevelFilter, trace};
+use tracing::{Instrument, Span, instrument, level_filters::LevelFilter};
 
 mod shard;
 
@@ -67,7 +67,7 @@ async fn host(shards: Vec<SocketAddr>) {
 	async fn assign_upstream(shards: &[ShardClient]) {
 		let mut ctx = Context::current();
 		dbg!(ctx.deadline - Instant::now());
-		ctx.deadline = Instant::now() + Duration::from_secs(6000);
+		ctx.deadline = Instant::now() + Duration::from_mins(100);
 		let [left, rest @ ..] = shards else { return };
 		if rest.is_empty() {
 			return;
@@ -112,7 +112,7 @@ async fn host(shards: Vec<SocketAddr>) {
 			.start(Context::current())
 			.instrument(Span::current())
 			.await
-			.unwrap()
+			.unwrap();
 	}
 
 	rocket::build()
@@ -157,7 +157,7 @@ async fn enumerate(shards: &State<Vec<ShardClient>>) -> Json<Vec<String>> {
 async fn get_value(key: String, shards: &State<Vec<ShardClient>>) -> (Status, Json<Option<Value>>) {
 	let mut hasher = DefaultHasher::new();
 	hasher.write(key.as_bytes());
-	let shard = &shards[(hasher.finish() as usize).rem(shards.len())];
+	let shard = &shards[(usize::try_from(hasher.finish()).unwrap()).rem(shards.len())];
 	let v = Json(shard.load(Context::current(), key).await.unwrap());
 
 	(
@@ -179,7 +179,7 @@ async fn put_value(
 ) -> (Status, Json<Option<Value>>) {
 	let mut hasher = DefaultHasher::new();
 	hasher.write(key.as_bytes());
-	let shard = &shards[(hasher.finish() as usize).rem(shards.len())];
+	let shard = &shards[usize::try_from(hasher.finish()).unwrap().rem(shards.len())];
 
 	let v = Json(match shard.store(Context::current(), key, data.0).await {
 		Ok(v) => v,

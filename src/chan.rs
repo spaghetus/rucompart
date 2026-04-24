@@ -7,7 +7,6 @@ use tarpc::{
 };
 use thiserror::Error;
 use tokio::{
-	io::AsyncWriteExt,
 	net::{TcpListener, TcpStream},
 	task::JoinSet,
 };
@@ -42,6 +41,7 @@ pub type PlannedChannel<K, S, R> = Channel<(), K, S, R>;
 
 #[allow(private_bounds)]
 impl<K: ChannelKind, S, R> Channel<(), K, S, R> {
+	#[must_use]
 	pub fn new(addresses: Vec<SocketAddr>) -> Self {
 		Self {
 			addresses,
@@ -80,7 +80,7 @@ impl<
 		let stream = loop {
 			match streams.join_next().await {
 				Some(Ok(Ok(Some(v)))) => break v,
-				Some(_) => continue,
+				Some(_) => (),
 				None => return Err(ChannelError::CouldntConnect),
 			}
 		};
@@ -124,7 +124,7 @@ impl<
 	}
 
 	pub async fn recv(mut self) -> Option<R> {
-		self.inner.next().await.and_then(|v| v.ok())
+		self.inner.next().await.and_then(std::result::Result::ok)
 	}
 }
 
@@ -139,7 +139,7 @@ impl<
 	}
 
 	pub async fn recv(&mut self) -> Option<R> {
-		self.inner.next().await.and_then(|v| v.ok())
+		self.inner.next().await.and_then(std::result::Result::ok)
 	}
 }
 
@@ -171,7 +171,10 @@ pub async fn channel<
 		.await;
 	let channel_spec = Channel {
 		_state: PhantomData,
-		addresses: listeners.iter().map(|l| l.local_addr().unwrap()).collect(),
+		addresses: listeners
+			.iter()
+			.filter_map(|l| l.local_addr().ok())
+			.collect(),
 		inner: (),
 	};
 	let wait_for_incoming = async move {

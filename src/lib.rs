@@ -1,3 +1,5 @@
+#![warn(clippy::pedantic)]
+#![allow(clippy::missing_errors_doc)]
 pub mod chan;
 
 use serde::{Deserialize, Serialize};

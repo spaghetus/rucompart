@@ -1,7 +1,6 @@
 use dashmap::DashMap;
-use futures::{FutureExt, SinkExt, StreamExt};
 use rayon::prelude::*;
-use rhai::{Dynamic, Engine, Func, Scope};
+use rhai::{Dynamic, Engine, Func};
 use rucompart::{
 	Compartment,
 	chan::{Channel, EstablishedChannel, Many},
@@ -14,9 +13,7 @@ use std::{
 	sync::{Arc, OnceLock},
 	time::Duration,
 };
-use tarpc::{serde_transport::Transport, tokio_serde::formats::Json};
 use tokio::{
-	net::TcpStream,
 	sync::{
 		Mutex,
 		mpsc::{Receiver, Sender},
@@ -80,6 +77,93 @@ pub(crate) struct ShardInner {
 	pub(crate) downward: Vec<EstablishedChannel<Many, DownwardsMessage, UpwardsMessage>>,
 }
 
+#[instrument(skip(inner, store))]
+async fn downwards_message(
+	inner: &mut ShardInner,
+	msg: DownwardsMessage,
+	store: &DashMap<String, Value>,
+) -> Option<UpwardsMessage> {
+	trace!("Got horizontal message!");
+	match msg {
+		DownwardsMessage::StartFilterMapReduce(source) => {
+			trace!("It's a map-reduce operation. Propagate down...");
+			for downward in &mut inner.downward {
+				let _ = downward
+					.send(DownwardsMessage::StartFilterMapReduce(source.clone()))
+					.await;
+			}
+			trace!("Preparing script...");
+			let engine = Engine::new();
+			let ast = engine.compile(source).unwrap();
+			let filter = Func::<(String, Dynamic), bool>::create_from_ast(
+				Engine::new(),
+				ast.clone(),
+				"filter",
+			);
+			let map = Func::<(String, Dynamic), Dynamic>::create_from_ast(
+				Engine::new(),
+				ast.clone(),
+				"map",
+			);
+			let reduce = Func::<(Dynamic, Dynamic), Dynamic>::create_from_ast(
+				Engine::new(),
+				ast.clone(),
+				"reduce",
+			);
+			let reduce = |l: Dynamic, r: Dynamic| -> Dynamic {
+				match (l.is_unit(), r.is_unit()) {
+					(true, true) => Dynamic::UNIT,
+					(true, false) => r,
+					(false, true) => l,
+					(false, false) => reduce(l, r).unwrap_or_default(),
+				}
+			};
+			trace!("Working on local data...");
+			let result = store
+				.par_iter()
+				.filter_map(|kv| {
+					filter(
+						kv.key().clone(),
+						rhai::serde::to_dynamic(kv.value()).unwrap(),
+					)
+					.unwrap_or_default()
+					.then_some(kv)
+				})
+				.map(|kv| {
+					map(
+						kv.key().clone(),
+						rhai::serde::to_dynamic(kv.value()).unwrap(),
+					)
+					.unwrap_or_default()
+				})
+				.reduce_with(&reduce);
+			trace!("Collecting incoming data...");
+			let mut received = vec![];
+			for downward in &mut inner.downward {
+				let Some(UpwardsMessage::FilterMapReduceResult(msg)) = downward.recv().await else {
+					continue;
+				};
+				received.extend(msg);
+			}
+			trace!("Combining...");
+			let result = result
+				.into_par_iter()
+				.map(|v| rhai::serde::from_dynamic::<Value>(&v).unwrap())
+				.chain(received)
+				.map(|v| rhai::serde::to_dynamic(&v).unwrap())
+				.reduce_with(reduce)
+				.unwrap_or_default();
+			trace!(
+				"Done! Passing up the chain. Here's the data so far:\n{:#?}",
+				result
+			);
+			Some(UpwardsMessage::FilterMapReduceResult(vec![
+				rhai::serde::from_dynamic(&result).unwrap(),
+			]))
+		}
+	}
+}
+
 #[instrument(skip(inner, store, server_commands, server_responses))]
 pub(crate) async fn shard_daemon(
 	inner: Arc<Mutex<ShardInner>>,
@@ -90,112 +174,24 @@ pub(crate) async fn shard_daemon(
 	loop {
 		trace!("Waiting for horizontal message...");
 		let mut inner = inner.lock().await;
-		#[instrument(skip(inner, store))]
-		async fn downwards_message(
-			inner: &mut ShardInner,
-			msg: DownwardsMessage,
-			store: &DashMap<String, Value>,
-		) -> Option<UpwardsMessage> {
-			trace!("Got horizontal message!");
-			match msg {
-				DownwardsMessage::StartFilterMapReduce(source) => {
-					trace!("It's a map-reduce operation. Propagate down...");
-					for downward in inner.downward.iter_mut() {
-						let _ = downward
-							.send(DownwardsMessage::StartFilterMapReduce(source.clone()))
-							.await;
-					}
-					trace!("Preparing script...");
-					let engine = Engine::new();
-					let ast = engine.compile(source).unwrap();
-					let filter = Func::<(String, Dynamic), bool>::create_from_ast(
-						Engine::new(),
-						ast.clone(),
-						"filter",
-					);
-					let map = Func::<(String, Dynamic), Dynamic>::create_from_ast(
-						Engine::new(),
-						ast.clone(),
-						"map",
-					);
-					let reduce = Func::<(Dynamic, Dynamic), Dynamic>::create_from_ast(
-						Engine::new(),
-						ast.clone(),
-						"reduce",
-					);
-					let reduce = |l: Dynamic, r: Dynamic| -> Dynamic {
-						match (l.is_unit(), r.is_unit()) {
-							(true, true) => Dynamic::UNIT,
-							(true, false) => r,
-							(false, true) => l,
-							(false, false) => reduce(l, r).unwrap_or_default(),
-						}
-					};
-					trace!("Working on local data...");
-					let result = store
-						.par_iter()
-						.filter_map(|kv| {
-							filter(
-								kv.key().clone(),
-								rhai::serde::to_dynamic(kv.value()).unwrap(),
-							)
-							.unwrap_or_default()
-							.then_some(kv)
-						})
-						.map(|kv| {
-							map(
-								kv.key().clone(),
-								rhai::serde::to_dynamic(kv.value()).unwrap(),
-							)
-							.unwrap_or_default()
-						})
-						.reduce_with(&reduce);
-					trace!("Collecting incoming data...");
-					let mut received = vec![];
-					for downward in inner.downward.iter_mut() {
-						let Some(UpwardsMessage::FilterMapReduceResult(msg)) =
-							downward.recv().await
-						else {
-							continue;
-						};
-						received.extend(msg);
-					}
-					trace!("Combining...");
-					let result = result
-						.into_par_iter()
-						.map(|v| rhai::serde::from_dynamic::<Value>(&v).unwrap())
-						.chain(received)
-						.map(|v| rhai::serde::to_dynamic(&v).unwrap())
-						.reduce_with(reduce)
-						.unwrap_or_default();
-					trace!(
-						"Done! Passing up the chain. Here's the data so far:\n{:#?}",
-						result
-					);
-					Some(UpwardsMessage::FilterMapReduceResult(vec![
-						rhai::serde::from_dynamic(&result).unwrap(),
-					]))
-				}
-			}
-		}
 		tokio::select! {
-			_ = tokio::time::sleep(Duration::from_millis(10)) => {}
+			() = tokio::time::sleep(Duration::from_millis(10)) => {}
 			msg = async {
 				if let Some(upward) = inner.upward.get_mut() {
 					upward.recv().await
 				} else {
-					tokio::time::sleep(Duration::from_secs(10000000)).await; unreachable!()
+					tokio::time::sleep(Duration::from_secs(10_000_000)).await; unreachable!()
 				}} => if let Some(msg) = msg {
 				let response = tokio::select! {
 					msg = downwards_message(&mut inner, msg, &store) => msg,
-					_ = tokio::time::sleep(Duration::from_secs(1)) => None
+					() = tokio::time::sleep(Duration::from_secs(1)) => None
 				};
 				if let Some(response) = response {inner.upward.get_mut().unwrap().send(response).await.unwrap();}
 			},
 			msg = server_commands.recv() => if let Some(msg) = msg {
 				let response = tokio::select! {
 					msg = downwards_message(&mut inner, msg, &store) => msg,
-					_ = tokio::time::sleep(Duration::from_secs(1)) => None
+					() = tokio::time::sleep(Duration::from_secs(1)) => None
 				};
 				if let Some(response) = response {server_responses.send(response).await.unwrap();}
 			}
@@ -204,7 +200,7 @@ pub(crate) async fn shard_daemon(
 }
 
 impl Shard for ShardService {
-	async fn start(self, context: ::tarpc::context::Context) {
+	async fn start(self, _context: ::tarpc::context::Context) {
 		let (command_sender, command_receiver) = tokio::sync::mpsc::channel(1);
 		let (response_sender, response_receiver) = tokio::sync::mpsc::channel(1);
 		self.commands
@@ -220,12 +216,12 @@ impl Shard for ShardService {
 				command_receiver,
 				response_sender,
 			)))
-			.unwrap()
+			.unwrap();
 	}
 
 	async fn set_upstream(
 		self,
-		context: ::tarpc::context::Context,
+		_context: ::tarpc::context::Context,
 		upstream: Channel<(), Many, UpwardsMessage, DownwardsMessage>,
 	) -> () {
 		let stream = upstream.connect().await.unwrap();
@@ -234,7 +230,7 @@ impl Shard for ShardService {
 
 	async fn get_downstream(
 		self,
-		context: ::tarpc::context::Context,
+		_context: ::tarpc::context::Context,
 	) -> Channel<(), Many, UpwardsMessage, DownwardsMessage> {
 		let (connection, spec) = rucompart::chan::channel().await.unwrap();
 		let inner_lock = self.inner.clone();
@@ -247,20 +243,24 @@ impl Shard for ShardService {
 
 	async fn store(
 		self,
-		context: ::tarpc::context::Context,
+		_context: ::tarpc::context::Context,
 		key: String,
 		value: Value,
 	) -> Option<Value> {
 		self.store.insert(key, value)
 	}
 
-	async fn load(self, context: ::tarpc::context::Context, key: String) -> Option<Value> {
+	async fn load(self, _context: ::tarpc::context::Context, key: String) -> Option<Value> {
 		self.store.get(&key).map(|v| v.clone())
 	}
 
 	/// Takes Rhai source code.
 	/// Only makes sense on shard 0.
-	async fn filter_map_reduce(self, context: ::tarpc::context::Context, program: String) -> Value {
+	async fn filter_map_reduce(
+		self,
+		_context: ::tarpc::context::Context,
+		program: String,
+	) -> Value {
 		self.commands
 			.get()
 			.unwrap()
@@ -275,7 +275,7 @@ impl Shard for ShardService {
 		result.first().cloned().unwrap_or_default()
 	}
 
-	async fn list(self, context: ::tarpc::context::Context) -> Vec<String> {
+	async fn list(self, _context: ::tarpc::context::Context) -> Vec<String> {
 		self.store.iter().map(|kv| kv.key().clone()).collect()
 	}
 }
