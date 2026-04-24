@@ -58,6 +58,7 @@ pub(crate) trait Shard {
 	async fn start();
 	async fn set_upstream(upstream: Channel<(), Many, UpwardsMessage, DownwardsMessage>);
 	async fn get_downstream() -> Channel<(), Many, UpwardsMessage, DownwardsMessage>;
+	async fn list() -> Vec<String>;
 	async fn store(key: String, value: Value) -> Option<Value>;
 	async fn load(key: String) -> Option<Value>;
 	/// Takes Rhai source code.
@@ -266,6 +267,10 @@ impl Shard for ShardService {
 			panic!("Protocol error!");
 		};
 		result.first().cloned().unwrap_or_default()
+	}
+
+	async fn list(self, context: ::tarpc::context::Context) -> Vec<String> {
+		self.store.iter().map(|kv| kv.key().clone()).collect()
 	}
 }
 

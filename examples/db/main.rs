@@ -7,6 +7,7 @@ use std::{
 
 use crate::shard::{ShardClient, ShardService};
 use clap::{Parser, Subcommand};
+use futures::StreamExt;
 use rhai::Engine;
 use rocket::{State, get, http::Status, post, routes, serde::json::Json};
 use rucompart::compartment_connect;
@@ -116,10 +117,39 @@ async fn host(shards: Vec<SocketAddr>) {
 
 	rocket::build()
 		.manage(shards)
-		.mount("/", routes![get_value, put_value, map_reduce])
+		.mount("/", routes![get_value, put_value, map_reduce, enumerate])
 		.launch()
 		.await
 		.unwrap();
+}
+
+#[get("/")]
+#[instrument(skip(shards))]
+async fn enumerate(shards: &State<Vec<ShardClient>>) -> Json<Vec<String>> {
+	let queries: JoinSet<_> = shards
+		.iter()
+		.map(|shard| {
+			tokio::spawn({
+				let shard = shard.clone();
+				async move { shard.list(Context::current()).await }
+			})
+		})
+		.collect();
+	let list = queries
+		.join_all()
+		.await
+		.into_iter()
+		.flatten()
+		.filter_map(|r| match r {
+			Ok(v) => Some(v),
+			Err(e) => {
+				eprintln!("One of our list queries failed with {e:#?}");
+				None
+			}
+		})
+		.flatten()
+		.collect();
+	Json(list)
 }
 
 #[get("/<key>")]
@@ -151,11 +181,14 @@ async fn put_value(
 	hasher.write(key.as_bytes());
 	let shard = &shards[(hasher.finish() as usize).rem(shards.len())];
 
-	let v = shard
-		.store(Context::current(), key, data.0)
-		.await
-		.unwrap()
-		.map(Json);
+	let v = (match shard.store(Context::current(), key, data.0).await {
+		Ok(v) => v,
+		Err(e) => {
+			eprintln!("Rpc failed with {e:#?}");
+			None
+		}
+	})
+	.map(Json);
 
 	(
 		if v.is_some() {
