@@ -154,11 +154,11 @@ async fn enumerate(shards: &State<Vec<ShardClient>>) -> Json<Vec<String>> {
 
 #[get("/<key>")]
 #[instrument(skip(shards))]
-async fn get_value(key: String, shards: &State<Vec<ShardClient>>) -> (Status, Option<Json<Value>>) {
+async fn get_value(key: String, shards: &State<Vec<ShardClient>>) -> (Status, Json<Option<Value>>) {
 	let mut hasher = DefaultHasher::new();
 	hasher.write(key.as_bytes());
 	let shard = &shards[(hasher.finish() as usize).rem(shards.len())];
-	let v = shard.load(Context::current(), key).await.unwrap().map(Json);
+	let v = Json(shard.load(Context::current(), key).await.unwrap());
 
 	(
 		if v.is_some() {
@@ -176,19 +176,18 @@ async fn put_value(
 	key: String,
 	shards: &State<Vec<ShardClient>>,
 	data: Json<Value>,
-) -> (Status, Option<Json<Value>>) {
+) -> (Status, Json<Option<Value>>) {
 	let mut hasher = DefaultHasher::new();
 	hasher.write(key.as_bytes());
 	let shard = &shards[(hasher.finish() as usize).rem(shards.len())];
 
-	let v = (match shard.store(Context::current(), key, data.0).await {
+	let v = Json(match shard.store(Context::current(), key, data.0).await {
 		Ok(v) => v,
 		Err(e) => {
 			eprintln!("Rpc failed with {e:#?}");
 			None
 		}
-	})
-	.map(Json);
+	});
 
 	(
 		if v.is_some() {
