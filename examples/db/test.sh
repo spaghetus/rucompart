@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 cargo b --example rucompart-db
 
-./../../target/debug/examples/rucompart-db -v trace guest [::]:8051 && echo "Guest 8051 bit the dust" & 
-./../../target/debug/examples/rucompart-db -v trace guest [::]:8052 && echo "Guest 8052 bit the dust" & 
-./../../target/debug/examples/rucompart-db -v trace guest [::]:8053 && echo "Guest 8053 bit the dust" & 
-./../../target/debug/examples/rucompart-db -v trace guest [::]:8054 && echo "Guest 8054 bit the dust" & 
-./../../target/debug/examples/rucompart-db -v trace guest [::]:8055 && echo "Guest 8055 bit the dust" & 
-./../../target/debug/examples/rucompart-db -v trace guest [::]:8056 && echo "Guest 8056 bit the dust" & 
-./../../target/debug/examples/rucompart-db -v trace guest [::]:8057 && echo "Guest 8057 bit the dust" & 
-./../../target/debug/examples/rucompart-db -v trace guest [::]:8058 && echo "Guest 8058 bit the dust" & 
-./../../target/debug/examples/rucompart-db -v trace guest [::]:8059 && echo "Guest 8059 bit the dust" & 
-./../../target/debug/examples/rucompart-db -v trace guest [::]:8060 && echo "Guest 8060 bit the dust" & 
+./../../target/debug/examples/rucompart-db -v debug guest [::]:8051 && echo "Guest 8051 bit the dust" &
+./../../target/debug/examples/rucompart-db -v debug guest [::]:8052 && echo "Guest 8052 bit the dust" &
+./../../target/debug/examples/rucompart-db -v debug guest [::]:8053 && echo "Guest 8053 bit the dust" &
+./../../target/debug/examples/rucompart-db -v debug guest [::]:8054 && echo "Guest 8054 bit the dust" &
+./../../target/debug/examples/rucompart-db -v debug guest [::]:8055 && echo "Guest 8055 bit the dust" &
+./../../target/debug/examples/rucompart-db -v debug guest [::]:8056 && echo "Guest 8056 bit the dust" &
+./../../target/debug/examples/rucompart-db -v debug guest [::]:8057 && echo "Guest 8057 bit the dust" &
+./../../target/debug/examples/rucompart-db -v debug guest [::]:8058 && echo "Guest 8058 bit the dust" &
+./../../target/debug/examples/rucompart-db -v debug guest [::]:8059 && echo "Guest 8059 bit the dust" &
+./../../target/debug/examples/rucompart-db -v debug guest [::]:8060 && echo "Guest 8060 bit the dust" &
 sleep 1s
-ROCKET_PORT=8050 ./../../target/debug/examples/rucompart-db -v trace host \
+ROCKET_PORT=8050 ./../../target/debug/examples/rucompart-db -v debug host \
     -s [::]:8051 \
     -s [::]:8052 \
     -s [::]:8053 \

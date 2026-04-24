@@ -10,6 +10,7 @@ use tokio::{
 	net::{TcpListener, TcpStream},
 	task::JoinSet,
 };
+use tracing::{debug, instrument};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Channel<C, K, S, R> {
@@ -57,10 +58,12 @@ impl<
 	R: for<'de> Deserialize<'de> + Send + Sync + Unpin + 'static,
 > Channel<(), K, S, R>
 {
+	#[instrument(skip(self))]
 	pub async fn connect(
 		self,
 	) -> Result<Channel<Transport<TcpStream, R, S, Json<R, S>>, K, S, R>, ChannelError> {
 		// let stream = TcpStream::connect(self.addresses.as_slice()).await?;
+		debug!("Connecting to one of {:?}...", self.addresses);
 		let mut streams = self
 			.addresses
 			.clone()
@@ -79,7 +82,12 @@ impl<
 			.collect::<JoinSet<_>>();
 		let stream = loop {
 			match streams.join_next().await {
-				Some(Ok(Ok(Some(v)))) => break v,
+				Some(Ok(Ok(Some(v)))) => {
+					if let Ok(addr) = v.local_addr() {
+						debug!("Connected to {addr:?}!");
+					}
+					break v;
+				}
 				Some(_) => (),
 				None => return Err(ChannelError::CouldntConnect),
 			}
@@ -143,6 +151,7 @@ impl<
 	}
 }
 
+#[instrument]
 pub async fn channel<
 	K: ChannelKind,
 	R: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static,
@@ -154,6 +163,7 @@ pub async fn channel<
 	),
 	ChannelError,
 > {
+	debug!("Listening on all interfaces...");
 	let listeners: Vec<TcpListener> = futures::stream::iter(netdev::get_interfaces())
 		.then(|iface| async move { futures::stream::iter(iface.ip_addrs()) })
 		.flatten()
@@ -177,6 +187,7 @@ pub async fn channel<
 			.collect(),
 		inner: (),
 	};
+	debug!("Now listening on {:?}.", channel_spec.addresses);
 	let wait_for_incoming = async move {
 		let mut connection = listeners
 			.into_iter()
@@ -185,6 +196,9 @@ pub async fn channel<
 		while let Some(Ok(result)) = connection.join_next().await {
 			match result {
 				Ok((stream, _socket)) => {
+					if let Ok(addr) = stream.local_addr() {
+						debug!("Got connection on {addr:?}!");
+					}
 					let codec_builder = LengthDelimitedCodec::builder();
 					let framed = codec_builder.new_framed(stream);
 					let transport = tarpc::serde_transport::new(framed, Json::default());

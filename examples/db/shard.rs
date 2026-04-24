@@ -34,7 +34,7 @@ pub enum DownwardsMessage {
 
 #[instrument]
 pub(crate) fn guest(addr: SocketAddr) {
-	trace!("Initializing...");
+	tracing::debug!("Initializing...");
 	let shard = ShardService {
 		inner: Arc::new(Mutex::new(ShardInner {
 			thread: OnceLock::new(),
@@ -46,7 +46,7 @@ pub(crate) fn guest(addr: SocketAddr) {
 		responses: Arc::new(Mutex::new(tokio::sync::mpsc::channel(1).1)),
 	};
 	let server = shard.clone();
-	trace!("Listening...");
+	tracing::debug!("Listening...");
 	shard.listen_on_tcp(server.serve(), addr)
 }
 
@@ -77,22 +77,22 @@ pub(crate) struct ShardInner {
 	pub(crate) downward: Vec<EstablishedChannel<Many, DownwardsMessage, UpwardsMessage>>,
 }
 
-#[instrument(skip(inner, store))]
+#[instrument(skip(inner, store, msg))]
 async fn downwards_message(
 	inner: &mut ShardInner,
 	msg: DownwardsMessage,
 	store: &DashMap<String, Value>,
 ) -> Option<UpwardsMessage> {
-	trace!("Got horizontal message!");
+	tracing::debug!("Got horizontal message!");
 	match msg {
 		DownwardsMessage::StartFilterMapReduce(source) => {
-			trace!("It's a map-reduce operation. Propagate down...");
+			tracing::debug!("It's a map-reduce operation. Propagate down...");
 			for downward in &mut inner.downward {
 				let _ = downward
 					.send(DownwardsMessage::StartFilterMapReduce(source.clone()))
 					.await;
 			}
-			trace!("Preparing script...");
+			tracing::debug!("Preparing script...");
 			let engine = Engine::new();
 			let ast = engine.compile(source).unwrap();
 			let filter = Func::<(String, Dynamic), bool>::create_from_ast(
@@ -118,7 +118,7 @@ async fn downwards_message(
 					(false, false) => reduce(l, r).unwrap_or_default(),
 				}
 			};
-			trace!("Working on local data...");
+			tracing::debug!("Working on local data...");
 			let result = store
 				.par_iter()
 				.filter_map(|kv| {
@@ -137,7 +137,7 @@ async fn downwards_message(
 					.unwrap_or_default()
 				})
 				.reduce_with(&reduce);
-			trace!("Collecting incoming data...");
+			tracing::debug!("Collecting incoming data...");
 			let mut received = vec![];
 			for downward in &mut inner.downward {
 				let Some(UpwardsMessage::FilterMapReduceResult(msg)) = downward.recv().await else {
@@ -145,7 +145,7 @@ async fn downwards_message(
 				};
 				received.extend(msg);
 			}
-			trace!("Combining...");
+			tracing::debug!("Combining...");
 			let result = result
 				.into_par_iter()
 				.map(|v| rhai::serde::from_dynamic::<Value>(&v).unwrap())
@@ -153,7 +153,7 @@ async fn downwards_message(
 				.map(|v| rhai::serde::to_dynamic(&v).unwrap())
 				.reduce_with(reduce)
 				.unwrap_or_default();
-			trace!(
+			tracing::debug!(
 				"Done! Passing up the chain. Here's the data so far:\n{:#?}",
 				result
 			);
@@ -172,7 +172,6 @@ pub(crate) async fn shard_daemon(
 	server_responses: Sender<UpwardsMessage>,
 ) {
 	loop {
-		trace!("Waiting for horizontal message...");
 		let mut inner = inner.lock().await;
 		tokio::select! {
 			() = tokio::time::sleep(Duration::from_millis(10)) => {}

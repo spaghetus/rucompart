@@ -14,13 +14,13 @@ use rucompart::compartment_connect;
 use serde_json::Value;
 use tarpc::context::Context;
 use tokio::{runtime::Runtime, task::JoinSet};
-use tracing::{Instrument, Span, instrument, level_filters::LevelFilter};
+use tracing::{Instrument, Span, debug, field::debug, instrument, level_filters::LevelFilter};
 
 mod shard;
 
 #[derive(Parser)]
 struct Args {
-	#[arg(short, default_value = "info")]
+	#[arg(short, default_value = "warn")]
 	verbosity: LevelFilter,
 	#[command(subcommand)]
 	mode: DbMode,
@@ -39,7 +39,7 @@ enum DbMode {
 
 fn main() {
 	let Args { mode, verbosity } = Args::parse();
-	tracing_subscriber::fmt().with_max_level(verbosity).finish();
+	tracing_subscriber::fmt().with_max_level(verbosity).init();
 
 	match mode {
 		DbMode::Host { shards } => Runtime::new().unwrap().block_on(host(shards)),
@@ -47,7 +47,7 @@ fn main() {
 	}
 }
 
-#[instrument]
+#[instrument(skip(shards))]
 async fn host(shards: Vec<SocketAddr>) {
 	let shards = shards
 		.into_iter()
@@ -157,7 +157,9 @@ async fn enumerate(shards: &State<Vec<ShardClient>>) -> Json<Vec<String>> {
 async fn get_value(key: String, shards: &State<Vec<ShardClient>>) -> (Status, Json<Option<Value>>) {
 	let mut hasher = DefaultHasher::new();
 	hasher.write(key.as_bytes());
-	let shard = &shards[(usize::try_from(hasher.finish()).unwrap()).rem(shards.len())];
+	let shard = usize::try_from(hasher.finish()).unwrap().rem(shards.len());
+	debug!("For key {key:?}, picked shard #{shard}.");
+	let shard = &shards[shard];
 	let v = Json(shard.load(Context::current(), key).await.unwrap());
 
 	(
@@ -173,21 +175,28 @@ async fn get_value(key: String, shards: &State<Vec<ShardClient>>) -> (Status, Js
 #[post("/<key>", data = "<data>")]
 #[instrument(skip(shards))]
 async fn put_value(
-	key: String,
+	key: &str,
 	shards: &State<Vec<ShardClient>>,
 	data: Json<Value>,
 ) -> (Status, Json<Option<Value>>) {
 	let mut hasher = DefaultHasher::new();
 	hasher.write(key.as_bytes());
-	let shard = &shards[usize::try_from(hasher.finish()).unwrap().rem(shards.len())];
+	let shard = usize::try_from(hasher.finish()).unwrap().rem(shards.len());
+	debug!("For key {key:?}, picked shard #{shard}.");
+	let shard = &shards[shard];
 
-	let v = Json(match shard.store(Context::current(), key, data.0).await {
-		Ok(v) => v,
-		Err(e) => {
-			eprintln!("Rpc failed with {e:#?}");
-			None
-		}
-	});
+	let v = Json(
+		match shard
+			.store(Context::current(), key.to_string(), data.0)
+			.await
+		{
+			Ok(v) => v,
+			Err(e) => {
+				eprintln!("Rpc failed with {e:#?}");
+				None
+			}
+		},
+	);
 
 	(
 		if v.is_some() {
