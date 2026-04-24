@@ -121,3 +121,5 @@ Channels abuse TCP/IP somewhat - they'll usually pick the best connection availa
 ## Aspirations
 
 If I had three more months, I would probably figure out some kind of network hole-punching so that compartments could reach one another in more diverse environments, and I would try to find a relatively painless way to support TLS.
+
+I would also like to use a slightly more compact wire format, since currently instructions are being serialized to JSON. Something like CBOR would be worth looking into.
