@@ -154,10 +154,18 @@ pub async fn channel<
 	ChannelError,
 > {
 	let listeners: Vec<TcpListener> = futures::stream::iter(netdev::get_interfaces())
-		.then(|iface| async move { futures::stream::iter(iface.global_ip_addrs()) })
+		.then(|iface| async move { futures::stream::iter(iface.ip_addrs()) })
 		.flatten()
-		.then(|addr| TcpListener::bind(SocketAddr::new(addr, 0)))
-		.filter_map(|conn| async move { conn.ok() })
+		.then(|addr| async move { (addr, TcpListener::bind(SocketAddr::new(addr, 0)).await) })
+		.filter_map(|(addr, conn)| async move {
+			match conn {
+				Ok(v) => Some(v),
+				Err(e) => {
+					eprintln!("Listening on {addr} failed with {e:#?}");
+					None
+				}
+			}
+		})
 		.collect()
 		.await;
 	let channel_spec = Channel {
