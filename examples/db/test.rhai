@@ -2,7 +2,7 @@ fn filter(key, value) {
     key.starts_with("item-")
 }
 
-fn map(value) {
+fn map(key, value) {
     value
 }
 

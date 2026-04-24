@@ -113,7 +113,7 @@ pub(crate) async fn shard_daemon(
 						ast.clone(),
 						"filter",
 					);
-					let map = Func::<(Dynamic,), Dynamic>::create_from_ast(
+					let map = Func::<(String, Dynamic), Dynamic>::create_from_ast(
 						Engine::new(),
 						ast.clone(),
 						"map",
@@ -140,9 +140,15 @@ pub(crate) async fn shard_daemon(
 								rhai::serde::to_dynamic(kv.value()).unwrap(),
 							)
 							.unwrap_or_default()
-							.then(|| kv.value().clone())
+							.then_some(kv)
 						})
-						.map(|v| map(rhai::serde::to_dynamic(v).unwrap()).unwrap_or_default())
+						.map(|kv| {
+							map(
+								kv.key().clone(),
+								rhai::serde::to_dynamic(kv.value()).unwrap(),
+							)
+							.unwrap_or_default()
+						})
 						.reduce_with(&reduce);
 					trace!("Collecting incoming data...");
 					let mut received = vec![];
