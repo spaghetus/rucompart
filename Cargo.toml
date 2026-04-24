@@ -32,6 +32,8 @@ standalone = []
 clap = { version = "4.6.1", features = ["derive"] }
 dashmap = { version = "6.1.0", features = ["rayon"] }
 eyre = "0.6.12"
+itertools = "0.14.0"
+ndarray = { version = "0.17.2", features = ["serde"] }
 rayon = "1.12.0"
 rhai = { version = "1.24.0", features = [
     "serde",
