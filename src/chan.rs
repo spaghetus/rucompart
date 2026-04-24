@@ -60,15 +60,30 @@ impl<
 	pub async fn connect(
 		self,
 	) -> Result<Channel<Transport<TcpStream, R, S, Json<R, S>>, K, S, R>, ChannelError> {
-		let stream = TcpStream::connect(self.addresses.as_slice()).await?;
-		//  Box::pin(
-		// 	futures::stream::iter(self.addresses.iter())
-		// 		.then()
-		// 		.filter_map(|v| async move { v.ok() }),
-		// )
-		// .next()
-		// .await
-		// .ok_or(ChannelError::CouldntConnect)?;
+		// let stream = TcpStream::connect(self.addresses.as_slice()).await?;
+		let mut streams = self
+			.addresses
+			.clone()
+			.into_iter()
+			.map(|addr| {
+				tokio::spawn(async move {
+					match TcpStream::connect(addr).await {
+						Ok(v) => Some(v),
+						Err(e) => {
+							eprintln!("Connecting to {addr} failed with: {e:#?}");
+							None
+						}
+					}
+				})
+			})
+			.collect::<JoinSet<_>>();
+		let stream = loop {
+			match streams.join_next().await {
+				Some(Ok(Ok(Some(v)))) => break v,
+				Some(_) => continue,
+				None => return Err(ChannelError::CouldntConnect),
+			}
+		};
 		let codec_builder = LengthDelimitedCodec::builder();
 		let framed = codec_builder.new_framed(stream);
 		let transport = tarpc::serde_transport::new(framed, Json::default());
